@@ -75,7 +75,6 @@ func (c *Connection) run() error {
 			size2read = dt.FixedSize
 		case 0:
 			size2read = 0
-			continue
 		case 1:
 			size2read = int(sbuf[0])
 		case 2:
