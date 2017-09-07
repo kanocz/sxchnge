@@ -21,7 +21,6 @@ type DataTypeCB struct {
 type Connection struct {
 	conn         *net.TCPConn         // real connection
 	writeMutex   sync.Mutex           // we need to lock on write operations
-	sentMessages uint32               // atomic counter
 	Types        map[uint8]DataTypeCB // map of type->params&callback
 	KeepAlive    time.Duration        // tcp keep-alive
 	ReadTimeout  time.Duration        // we need to receive new message at least once per this duration
