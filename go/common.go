@@ -95,7 +95,10 @@ func (c *Connection) run() error {
 			}
 		}
 
-		dt.Callback(msg[0:size2read], c)
+		// we need to allow types that only can be send by one of the side, but also defined
+		if nil != dt.Callback {
+			dt.Callback(msg[0:size2read], c)
+		}
 	}
 }
 
