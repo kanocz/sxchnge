@@ -8,7 +8,7 @@ import (
 )
 
 // CB type for callback function for each type of transfered data
-type CB func([]byte)
+type CB func([]byte, *Connection)
 
 // DataTypeCB describes
 type DataTypeCB struct {
@@ -95,7 +95,7 @@ func (c *Connection) run() error {
 			}
 		}
 
-		dt.Callback(msg[0:size2read])
+		dt.Callback(msg[0:size2read], c)
 	}
 }
 
