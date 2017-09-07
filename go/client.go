@@ -19,7 +19,7 @@ func (c *Connection) Connect(address string) error {
 		return err
 	}
 
-	c.run()
+	go c.run()
 
 	return nil
 }
