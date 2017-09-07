@@ -7,7 +7,7 @@ import (
 )
 
 // ListenOne is one-connection server
-func (c *Connection) ListenOne(address string) error {
+func (c *Connection) ListenOne(address string, onConnect func(*Connection)) error {
 
 	tcpaddr, err := net.ResolveTCPAddr("tcp", address)
 	if nil != err {
@@ -28,6 +28,8 @@ func (c *Connection) ListenOne(address string) error {
 				time.Sleep(time.Second)
 				continue
 			}
+
+			go onConnect(c)
 
 			c.run()
 		}

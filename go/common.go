@@ -178,3 +178,12 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 
 	return nil
 }
+
+// Remote address retrive
+func (c *Connection) Remote() net.Addr {
+	if nil == c.conn {
+		return nil
+	}
+
+	return c.conn.RemoteAddr()
+}
