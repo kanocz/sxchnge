@@ -65,21 +65,25 @@ int main() {
   puts("Processing incomming message... (waiting for pint from server)");
   if (0 != SXProcessMsg(&sxconn, sxconn.socket)) {
     perror("SXProcessMsg");
+    return -2;
   }
 
   puts("Sending ping...");
   if (0 != SXWriteMsg(&sxconn, sxconn.socket, typePing, NULL, 0)) {
     perror("SXWriteMsg");
+    return -3;
   }
 
   puts("Processing incomming message...");
   if (0 != SXProcessMsg(&sxconn, sxconn.socket)) {
     perror("SXProcessMsg");
+    return -4;
   }
 
   puts("Sending string...");
   if (0 != SXWriteMsg(&sxconn, sxconn.socket, typeString, "Hello world!", 12)) {
     perror("SXWriteMsg");
+    return -5;
   }
 
   someData someDataVal = {.ID = 333, .Value = 12.345678};
@@ -88,5 +92,8 @@ int main() {
   if (0 != SXWriteMsg(&sxconn, sxconn.socket, typeSomeData,
                       (char *)&someDataVal, sizeof(someDataVal))) {
     perror("SXWriteMsg");
+    return -6;
   }
+
+  return 0;
 }

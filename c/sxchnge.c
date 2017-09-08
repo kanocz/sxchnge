@@ -6,6 +6,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <stdio.h>
+
 #include "sxchnge.h"
 
 #define LISTEN_BACKLOG 1024
@@ -39,17 +41,6 @@ inline static int setSockOptions(int sock, struct SXConnection *conn) {
 inline static int loopWrite(int sock, uint8_t *data, size_t len) {
   for (size_t i = 0; i < len; i++) {
     ssize_t x = write(sock, data + i, len - i);
-    if (x < 0) {
-      return -5;
-    }
-    i += (size_t)x;
-  }
-  return 0;
-}
-
-inline static int loopRead(int sock, uint8_t *data, size_t len) {
-  for (size_t i = 0; i < len; i++) {
-    ssize_t x = read(sock, data + i, len - i);
     if (x < 0) {
       return -5;
     }
@@ -195,8 +186,8 @@ int SXWriteMsg(struct SXConnection *conn, int sock, uint8_t msgType, char *msg,
     return -4;
   }
 
-  loopWrite(sock, header, headerLen);
-  loopWrite(sock, (uint8_t *)msg, msgLen);
+  if (loopWrite(sock, header, headerLen) < 0) return -5;
+  if (loopWrite(sock, (uint8_t *)msg, msgLen) < 0) return -5;
 
   return 0;
 }
@@ -205,13 +196,8 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
 
   uint8_t msgType = 0;
 
-  ssize_t x = 0;
-  while (x == 0) {
-    x = read(sock, &msgType, 1);
-  }
-
-  if (x < 0) {
-    return -2;
+  if (recv(sock, &msgType, 1, MSG_WAITALL) != 1) {
+      return -2;
   }
 
   struct SXDataType *dt = conn->SXDataType[msgType];
@@ -221,7 +207,11 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
   }
 
   uint8_t sizebuf[4];
-  loopRead(sock, sizebuf, (size_t)dt->SizeBytes);
+  if (dt->SizeBytes > 0) {
+  if (recv(sock, sizebuf, (size_t)dt->SizeBytes, MSG_WAITALL) != dt->SizeBytes) {
+      return -2;
+  }
+  }
 
   uint32_t size2read = 0;
 
@@ -248,7 +238,9 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
     if (NULL == buf) {
       return -10;
     }
-    loopRead(sock, buf, size2read);
+    if (recv(sock, buf, size2read, MSG_WAITALL) != size2read) {
+        return -2;
+    }
   }
 
   if (dt->Callback) {

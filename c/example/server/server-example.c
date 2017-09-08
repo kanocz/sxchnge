@@ -106,12 +106,14 @@ int main() {
   puts("We have connection, sending ping...");
   if (0 != SXWriteMsg(&sxconn, sock, typePing, NULL, 0)) {
     perror("SXWriteMsg");
+    return -2;
   }
 
   while (1) {
     puts("Processing incomming message...");
     if (0 != SXProcessMsg(&sxconn, sock)) {
       perror("SXProcessMsg");
+      return -3;
     }
   }
 }
