@@ -15,3 +15,13 @@
 
 go/example/client/client
 go/example/server/server
+c/example/client/client-example
+c/example/server/server-example
+c/sxchnge.config
+c/sxchnge.creator
+c/sxchnge.creator.user
+c/sxchnge.files
+c/sxchnge.includes
+c/libsxchnge.a
+c/*.o
+c/example/*/*.o
