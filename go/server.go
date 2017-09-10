@@ -7,7 +7,7 @@ import (
 )
 
 // ListenOne is one-connection server
-func (c *Connection) ListenOne(address string, onConnect func(*Connection)) error {
+func (c *Connection) ListenOne(address string, onConnect func(*Connection, <-chan interface{})) error {
 
 	tcpaddr, err := net.ResolveTCPAddr("tcp", address)
 	if nil != err {
@@ -36,9 +36,11 @@ func (c *Connection) ListenOne(address string, onConnect func(*Connection)) erro
 				continue
 			}
 
-			go onConnect(c)
+			closeChan := make(chan interface{})
+			go onConnect(c, closeChan)
 
 			c.run()
+			close(closeChan)
 		}
 	}()
 

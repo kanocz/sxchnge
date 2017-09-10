@@ -91,7 +91,7 @@ func main() {
 		},
 	}
 
-	err := connection.ListenOne(":3456", func(c *sxchange.Connection) {
+	err := connection.ListenOne(":3456", func(c *sxchange.Connection, closeChan <-chan interface{}) {
 		// send ping on connect
 		log.Println("New connection from", c.Remote(), ", sending ping!")
 		err := connection.WriteMsg(typePing, []byte{})
@@ -99,6 +99,8 @@ func main() {
 			log.Println("Error sending ping:", err)
 		}
 
+		<-closeChan
+		log.Println("Connection closed")
 	})
 	if nil != err {
 		log.Fatalln("Error listening:", err)
