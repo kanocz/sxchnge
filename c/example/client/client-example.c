@@ -35,6 +35,11 @@ void pongHandler(void *data, size_t size, int sock, struct SXConnection *conn) {
 
 int main() {
 
+  if (SXInit() != 0) {
+    puts("SXChange init error");
+    return -1;
+  }
+
   struct SXConnection sxconn = {
       .KeepAlive = 5,
       .MaxSize = 1024,
