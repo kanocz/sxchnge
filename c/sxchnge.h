@@ -7,10 +7,11 @@
 
 struct SXConnection;
 
-typedef void (*SXCB)(void *data, size_t size, int sock, struct SXConnection *conn);
+typedef void (*SXCB)(void *data, size_t size, int sock,
+                     struct SXConnection *conn);
 
 struct SXDataType {
-  int SizeBytes;
+  int8_t SizeBytes;
   uint32_t FixedSize;
   SXCB Callback;
 };
@@ -22,8 +23,8 @@ struct SXConnection {
   int KeepAlive;
   struct timeval ReadTimeout;
   struct timeval WriteTimeout;
-  int MaxSize;
-} ;
+  uint32_t MaxSize;
+};
 
 int SXConnect(char *ip, uint16_t port, struct SXConnection *conn);
 int SXListen(uint16_t port, struct SXConnection *conn);

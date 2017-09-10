@@ -11,6 +11,16 @@
 #include "sxchnge.h"
 
 #define LISTEN_BACKLOG 1024
+#define headerHello                                                            \
+  { 's', 'x', 'c', 'h', 'n', 'g', 1, 0 }
+
+#define initialPacketSize 1292
+struct initialPacket {
+  char Header[8];
+  uint32_t MaxSize;
+  int8_t SizeBytes[256];
+  uint32_t FixedSizes[256];
+};
 
 inline static int setSockOptions(int sock, struct SXConnection *conn) {
   int yes = 1;
@@ -49,6 +59,47 @@ inline static int loopWrite(int sock, uint8_t *data, size_t len) {
   return 0;
 }
 
+static void prepareInitialPacker(struct initialPacket *ip,
+                                 struct SXConnection *conn) {
+  static char header[8] = headerHello;
+  for (int i = 0; i < 8; i++)
+    ip->Header[i] = header[i];
+  ip->MaxSize = conn->MaxSize;
+  for (int i = 0; i < 256; i++) {
+    struct SXDataType *dt = conn->SXDataType[i];
+    if (NULL != dt) {
+      ip->FixedSizes[i] = dt->FixedSize;
+      ip->SizeBytes[i] = dt->SizeBytes;
+    } else {
+      ip->FixedSizes[i] = 0;
+      ip->SizeBytes[i] = 0;
+    }
+  }
+}
+
+static int connectionInit(int sock, struct SXConnection *conn) {
+  char sendBuf[initialPacketSize];
+  char recvBuf[initialPacketSize];
+  prepareInitialPacker((struct initialPacket *)sendBuf, conn);
+  if (loopWrite(sock, (uint8_t *)sendBuf, initialPacketSize) < 0)
+    return -1;
+  if (recv(sock, recvBuf, initialPacketSize, MSG_WAITALL) != initialPacketSize)
+    return -2;
+  if (0 != memcmp(sendBuf, recvBuf, initialPacketSize))
+    return -3;
+  return 0;
+}
+
+int SXInit() {
+  if (sizeof(struct initialPacket) != initialPacketSize) {
+    printf("Comiler aligment not equeal to golang style, please check (%ld != "
+           "%d)\n",
+           sizeof(struct initialPacket), initialPacketSize);
+    return -1;
+  }
+  return 0;
+}
+
 int SXConnect(char *ip, uint16_t port, struct SXConnection *conn) {
 
   int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -78,7 +129,13 @@ int SXConnect(char *ip, uint16_t port, struct SXConnection *conn) {
   }
 
   if (setSockOptions(sock, conn) < 0) {
+    close(sock);
     return -5;
+  }
+
+  if (connectionInit(sock, conn) < 0) {
+    close(sock);
+    return -6;
   }
 
   conn->socket = sock;
@@ -110,7 +167,7 @@ int SXListen(uint16_t port, struct SXConnection *conn) {
   }
 
   if (listen(sock, LISTEN_BACKLOG) < 0) {
-      return -4;
+    return -4;
   }
 
   conn->socket = sock;
@@ -129,7 +186,13 @@ int SXAccpet(struct SXConnection *conn) {
   }
 
   if (setSockOptions(sock, conn) < 0) {
+    close(sock);
     return -5;
+  }
+
+  if (connectionInit(sock, conn) < 0) {
+    close(sock);
+    return -6;
   }
 
   return sock;
@@ -186,8 +249,10 @@ int SXWriteMsg(struct SXConnection *conn, int sock, uint8_t msgType, char *msg,
     return -4;
   }
 
-  if (loopWrite(sock, header, headerLen) < 0) return -5;
-  if (loopWrite(sock, (uint8_t *)msg, msgLen) < 0) return -5;
+  if (loopWrite(sock, header, headerLen) < 0)
+    return -5;
+  if (loopWrite(sock, (uint8_t *)msg, msgLen) < 0)
+    return -5;
 
   return 0;
 }
@@ -197,7 +262,7 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
   uint8_t msgType = 0;
 
   if (recv(sock, &msgType, 1, MSG_WAITALL) != 1) {
-      return -2;
+    return -2;
   }
 
   struct SXDataType *dt = conn->SXDataType[msgType];
@@ -208,9 +273,10 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
 
   uint8_t sizebuf[4];
   if (dt->SizeBytes > 0) {
-  if (recv(sock, sizebuf, (size_t)dt->SizeBytes, MSG_WAITALL) != dt->SizeBytes) {
+    if (recv(sock, sizebuf, (size_t)dt->SizeBytes, MSG_WAITALL) !=
+        dt->SizeBytes) {
       return -2;
-  }
+    }
   }
 
   uint32_t size2read = 0;
@@ -239,7 +305,7 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
       return -10;
     }
     if (recv(sock, buf, size2read, MSG_WAITALL) != size2read) {
-        return -2;
+      return -2;
     }
   }
 

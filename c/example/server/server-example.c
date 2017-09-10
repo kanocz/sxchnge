@@ -65,7 +65,7 @@ int main() {
 
   struct SXConnection sxconn = {
       .KeepAlive = 5,
-      .MaxSize = 4096,
+      .MaxSize = 1024,
       .ReadTimeout = {.tv_sec = 3, .tv_usec = 0},
       .WriteTimeout = {.tv_sec = 3, .tv_usec = 0},
       .SXDataType =
