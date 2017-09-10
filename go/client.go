@@ -19,6 +19,12 @@ func (c *Connection) Connect(address string) error {
 		return err
 	}
 
+	err = c.initConnection()
+	if nil != err {
+		c.conn.Close()
+		return err
+	}
+
 	go c.run()
 
 	return nil

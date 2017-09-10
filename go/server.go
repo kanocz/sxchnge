@@ -29,6 +29,13 @@ func (c *Connection) ListenOne(address string, onConnect func(*Connection)) erro
 				continue
 			}
 
+			err = c.initConnection()
+			if nil != err {
+				log.Println(err)
+				c.conn.Close()
+				continue
+			}
+
 			go onConnect(c)
 
 			c.run()

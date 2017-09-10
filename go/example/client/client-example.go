@@ -58,7 +58,7 @@ func main() {
 			},
 			typeSomeData: sxchange.DataTypeCB{ // send-only type without callback
 				SizeBytes: -1, // using fixed size
-				FixedSize: int(unsafe.Sizeof(someData{})),
+				FixedSize: int32(unsafe.Sizeof(someData{})),
 			},
 			typeSomeDataJSON: sxchange.DataTypeCB{ // send-only type without callback
 				SizeBytes: 2, // up to 65535 bytes string length

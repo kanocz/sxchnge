@@ -82,7 +82,7 @@ func main() {
 			typeSomeData: sxchange.DataTypeCB{
 				Callback:  someDataHandler,
 				SizeBytes: -1, // using fixed size
-				FixedSize: int(unsafe.Sizeof(someData{})),
+				FixedSize: int32(unsafe.Sizeof(someData{})),
 			},
 			typeSomeDataJSON: sxchange.DataTypeCB{
 				Callback:  someDataJSONHandler,

@@ -1,10 +1,18 @@
 package sxchange
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
+	"unsafe"
+)
+
+const (
+	verHI = 1
+	verLO = 0
 )
 
 // CB type for callback function for each type of transfered data
@@ -12,9 +20,9 @@ type CB func([]byte, *Connection)
 
 // DataTypeCB describes
 type DataTypeCB struct {
-	SizeBytes int // -1 for fixed size, 0 for no data (ping?), 1 for 0-255 bytes, 2 for 0-65535 bytes...
-	FixedSize int // if some struct has fixed fize no other header needed
-	Callback  CB  // which function to run after data received
+	SizeBytes int8  // -1 for fixed size, 0 for no data (ping?), 1 for 0-255 bytes, 2 for 0-65535 bytes...
+	FixedSize int32 // if some struct has fixed fize no other header needed
+	Callback  CB    // which function to run after data received
 }
 
 // Connection informaion both for client or server
@@ -25,18 +33,64 @@ type Connection struct {
 	KeepAlive    time.Duration        // tcp keep-alive
 	ReadTimeout  time.Duration        // we need to receive new message at least once per this duration
 	WriteTimeout time.Duration        // maximal duration for every write operation
-	MaxSize      int                  // maximum number of bytes for one record/message
+	MaxSize      uint32               // maximum number of bytes for one record/message
+}
+
+const (
+	initialPacketSize = 1292 // we need to compare it manualy to be sure that compiler doesn't change aligment!
+)
+
+type initialPacket struct {
+	Header    [8]uint8 // sxchngXY where X.Y is version of protocol
+	MaxSize   uint32
+	SizeBytes [256]int8
+	FixedSize [256]int32
+}
+
+func (c *Connection) initConnection() error {
+	if c.KeepAlive != 0 {
+		c.conn.SetKeepAlivePeriod(c.KeepAlive)
+		c.conn.SetKeepAlive(true)
+	}
+
+	// initial packets exchange
+	initial := c.prepareInitialPacket()
+	initialBuf := (*[initialPacketSize]byte)(unsafe.Pointer(&initial))[:]
+	received := initialPacket{}
+	receivedBuf := (*[initialPacketSize]byte)(unsafe.Pointer(&received))[:]
+
+	// send out version
+	c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
+	_, err := c.conn.Write(initialBuf)
+	if nil != err {
+		return err
+	}
+
+	c.conn.SetReadDeadline(time.Now().Add(c.ReadTimeout))
+	_, err = c.conn.Read(receivedBuf)
+	if nil != err {
+		return err
+	}
+
+	if received.Header != initial.Header {
+		return errors.New("HS error - different protocol version")
+	}
+
+	if received.MaxSize != initial.MaxSize {
+		return errors.New("HS error - different message maximal size")
+	}
+
+	if (received.FixedSize != initial.FixedSize) || (received.MaxSize != received.MaxSize) {
+		return errors.New("HS error - different set of datatypes")
+	}
+
+	return nil
 }
 
 // internal run function
 func (c *Connection) run() error {
 
 	defer c.conn.Close()
-
-	if c.KeepAlive != 0 {
-		c.conn.SetKeepAlivePeriod(c.KeepAlive)
-		c.conn.SetKeepAlive(true)
-	}
 
 	var (
 		sbuf [4]byte
@@ -71,7 +125,7 @@ func (c *Connection) run() error {
 
 		switch dt.SizeBytes {
 		case -1:
-			size2read = dt.FixedSize
+			size2read = int(dt.FixedSize)
 		case 0:
 			size2read = 0
 		case 1:
@@ -116,7 +170,7 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 
 	switch dt.SizeBytes {
 	case -1:
-		size2write = dt.FixedSize
+		size2write = int(dt.FixedSize)
 	case 0:
 		size2write = 0
 	case 1:
@@ -184,4 +238,21 @@ func (c *Connection) Remote() net.Addr {
 	}
 
 	return c.conn.RemoteAddr()
+}
+
+func (c *Connection) prepareInitialPacket() initialPacket {
+	result := initialPacket{MaxSize: c.MaxSize, Header: [8]byte{'s', 'x', 'c', 'h', 'n', 'g', verHI, verLO}}
+
+	for i := 0; i < 256; i++ {
+		result.FixedSize[i] = c.Types[uint8(i)].FixedSize
+		result.SizeBytes[i] = c.Types[uint8(i)].SizeBytes
+	}
+
+	return result
+}
+
+func init() {
+	if initialPacketSize != unsafe.Sizeof(initialPacket{}) {
+		log.Fatalln("Golang uses different aligment withing structure, please modify sxchnge code!")
+	}
 }
