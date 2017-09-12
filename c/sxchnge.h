@@ -26,7 +26,7 @@ struct SXConnection {
   uint32_t MaxSize;
 };
 
-int SXInit();
+int SXInit(void);
 int SXConnect(char *ip, uint16_t port, struct SXConnection *conn);
 int SXListen(uint16_t port, struct SXConnection *conn);
 int SXAccpet(struct SXConnection *conn);

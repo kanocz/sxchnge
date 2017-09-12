@@ -90,7 +90,7 @@ static int connectionInit(int sock, struct SXConnection *conn) {
   return 0;
 }
 
-int SXInit() {
+int SXInit(void) {
   if (sizeof(struct initialPacket) != initialPacketSize) {
     printf("Comiler aligment not equeal to golang style, please check (%ld != "
            "%d)\n",
