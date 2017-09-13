@@ -3,6 +3,7 @@ package sxchange
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -50,14 +51,13 @@ type initialPacket struct {
 func readAll(conn *net.TCPConn, buf []byte, size int, timeout time.Duration) error {
 
 	totalDeadline := time.Now().Add(timeout)
-
-	for i := 0; i < size; i++ {
-		conn.SetReadDeadline(totalDeadline)
-		j, err := conn.Read(buf[i:size])
-		i += j
-		if nil != err {
-			return err
-		}
+	conn.SetReadDeadline(totalDeadline)
+	i, err := io.ReadFull(conn, buf[:size])
+	if nil != err {
+		return err
+	}
+	if i != size {
+		return errors.New("Partial read")
 	}
 
 	return nil
