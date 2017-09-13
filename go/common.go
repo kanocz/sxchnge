@@ -47,6 +47,37 @@ type initialPacket struct {
 	FixedSize [256]int32
 }
 
+func readAll(conn *net.TCPConn, buf []byte, size int, timeout time.Duration) error {
+
+	totalDeadline := time.Now().Add(timeout)
+
+	for i := 0; i < size; i++ {
+		conn.SetReadDeadline(totalDeadline)
+		j, err := conn.Read(buf[i:size])
+		i += j
+		if nil != err {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func writeAll(conn *net.TCPConn, buf []byte, size int, timeout time.Duration) error {
+	totalDeadline := time.Now().Add(timeout)
+
+	for i := 0; i < size; i++ {
+		conn.SetWriteDeadline(totalDeadline)
+		j, err := conn.Write(buf[i:size])
+		i += j
+		if nil != err {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (c *Connection) initConnection() error {
 	if c.KeepAlive != 0 {
 		c.conn.SetKeepAlivePeriod(c.KeepAlive)
@@ -60,14 +91,12 @@ func (c *Connection) initConnection() error {
 	receivedBuf := (*[initialPacketSize]byte)(unsafe.Pointer(&received))[:]
 
 	// send out version
-	c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
-	_, err := c.conn.Write(initialBuf)
+	err := writeAll(c.conn, initialBuf, initialPacketSize, c.WriteTimeout)
 	if nil != err {
 		return err
 	}
 
-	c.conn.SetReadDeadline(time.Now().Add(c.ReadTimeout))
-	_, err = c.conn.Read(receivedBuf)
+	err = readAll(c.conn, receivedBuf, initialPacketSize, c.ReadTimeout)
 	if nil != err {
 		return err
 	}
@@ -116,8 +145,7 @@ func (c *Connection) run() error {
 
 		var size2read int
 		if dt.SizeBytes > 0 {
-			c.conn.SetReadDeadline(time.Now().Add(c.ReadTimeout))
-			i, err = c.conn.Read(sbuf[0:dt.SizeBytes])
+			err = readAll(c.conn, sbuf[0:dt.SizeBytes], int(dt.SizeBytes), c.ReadTimeout)
 			if nil != err {
 				return err
 			}
@@ -138,13 +166,9 @@ func (c *Connection) run() error {
 			return fmt.Errorf("Structure type %d has invalid SizeBytes setting (%d)", t[0], dt.SizeBytes)
 		}
 
-		for i := 0; i < size2read; i++ {
-			c.conn.SetReadDeadline(time.Now().Add(c.ReadTimeout))
-			j, err := c.conn.Read(msg[i:size2read])
-			i += j
-			if nil != err {
-				return err
-			}
+		err = readAll(c.conn, msg, size2read, c.ReadTimeout)
+		if nil != err {
+			return err
 		}
 
 		// we need to allow types that only can be send by one of the side, but also defined
@@ -210,22 +234,14 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
 
-	for i := 0; i < headerSize; i++ {
-		c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
-		j, err := c.conn.Write(header[i:headerSize])
-		if nil != err {
-			return err
-		}
-		i += j
+	err := writeAll(c.conn, header[:], headerSize, c.WriteTimeout)
+	if nil != err {
+		return err
 	}
 
-	for i := 0; i < size2write; i++ {
-		c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
-		j, err := c.conn.Write(msg[i:size2write])
-		if nil != err {
-			return err
-		}
-		i += j
+	err = writeAll(c.conn, msg, size2write, c.WriteTimeout)
+	if nil != err {
+		return err
 	}
 
 	return nil
