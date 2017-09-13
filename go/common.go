@@ -65,14 +65,14 @@ func readAll(conn *net.TCPConn, buf []byte, size int, timeout time.Duration) err
 
 func writeAll(conn *net.TCPConn, buf []byte, size int, timeout time.Duration) error {
 	totalDeadline := time.Now().Add(timeout)
+	conn.SetWriteDeadline(totalDeadline)
+	i, err := conn.Write(buf[:size])
 
-	for i := 0; i < size; i++ {
-		conn.SetWriteDeadline(totalDeadline)
-		j, err := conn.Write(buf[i:size])
-		i += j
-		if nil != err {
-			return err
-		}
+	if nil != err {
+		return err
+	}
+	if i != size {
+		return errors.New("Partial write")
 	}
 
 	return nil
