@@ -35,6 +35,7 @@ type Connection struct {
 	ReadTimeout  time.Duration        // we need to receive new message at least once per this duration
 	WriteTimeout time.Duration        // maximal duration for every write operation
 	MaxSize      uint32               // maximum number of bytes for one record/message
+	DoneChan     chan bool            // can be set do end message reading loop
 }
 
 const (
@@ -128,6 +129,13 @@ func (c *Connection) run() error {
 	)
 
 	for {
+
+		select {
+		case <-c.DoneChan:
+			return nil
+		default:
+		}
+
 		c.conn.SetReadDeadline(time.Now().Add(c.ReadTimeout))
 		i, err := c.conn.Read(t[:])
 		if nil != err {
@@ -169,6 +177,13 @@ func (c *Connection) run() error {
 		err = readAll(c.conn, msg, size2read, c.ReadTimeout)
 		if nil != err {
 			return err
+		}
+
+		// one more check on done channel - we don't want to call callback after it has been closed
+		select {
+		case <-c.DoneChan:
+			return nil
+		default:
 		}
 
 		// we need to allow types that only can be send by one of the side, but also defined
