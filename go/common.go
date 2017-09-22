@@ -1,6 +1,7 @@
 package sxchange
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -35,7 +36,7 @@ type Connection struct {
 	ReadTimeout  time.Duration        // we need to receive new message at least once per this duration
 	WriteTimeout time.Duration        // maximal duration for every write operation
 	MaxSize      uint32               // maximum number of bytes for one record/message
-	DoneChan     chan bool            // can be set do end message reading loop
+	Ctx          context.Context      // context for cancel and also for other values
 }
 
 const (
@@ -131,7 +132,7 @@ func (c *Connection) run() error {
 	for {
 
 		select {
-		case <-c.DoneChan:
+		case <-c.Ctx.Done():
 			return nil
 		default:
 		}
@@ -181,7 +182,7 @@ func (c *Connection) run() error {
 
 		// one more check on done channel - we don't want to call callback after it has been closed
 		select {
-		case <-c.DoneChan:
+		case <-c.Ctx.Done():
 			return nil
 		default:
 		}
