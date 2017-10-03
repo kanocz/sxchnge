@@ -122,6 +122,9 @@ func (c *Connection) initConnection() error {
 func (c *Connection) run() error {
 
 	defer c.conn.Close()
+	if nil == c.Ctx {
+		c.Ctx = context.Background()
+	}
 
 	var (
 		sbuf [4]byte
