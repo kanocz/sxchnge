@@ -25,6 +25,8 @@ func (c *Connection) Connect(address string) error {
 		return err
 	}
 
+	c.CloseChan = make(chan interface{})
+
 	go c.run()
 
 	return nil

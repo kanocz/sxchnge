@@ -36,7 +36,8 @@ type Connection struct {
 	ReadTimeout  time.Duration        // we need to receive new message at least once per this duration
 	WriteTimeout time.Duration        // maximal duration for every write operation
 	MaxSize      uint32               // maximum number of bytes for one record/message
-	Ctx          context.Context      // context for cancel and also for other values
+	Ctx          context.Context      // context for some values like server id
+	CloseChan    chan interface{}     // channel for closing incoming messages circle
 }
 
 const (
@@ -122,9 +123,6 @@ func (c *Connection) initConnection() error {
 func (c *Connection) run() error {
 
 	defer c.conn.Close()
-	if nil == c.Ctx {
-		c.Ctx = context.Background()
-	}
 
 	var (
 		sbuf [4]byte
@@ -135,7 +133,7 @@ func (c *Connection) run() error {
 	for {
 
 		select {
-		case <-c.Ctx.Done():
+		case <-c.CloseChan:
 			return nil
 		default:
 		}
@@ -185,7 +183,7 @@ func (c *Connection) run() error {
 
 		// one more check on done channel - we don't want to call callback after it has been closed
 		select {
-		case <-c.Ctx.Done():
+		case <-c.CloseChan:
 			return nil
 		default:
 		}

@@ -36,14 +36,16 @@ func (c *Connection) ListenOne(address string, onConnect func(*Connection, <-cha
 				continue
 			}
 
-			closeChan := make(chan interface{})
-			go onConnect(c, closeChan)
+			c.CloseChan = make(chan interface{})
+			threadCloseChan := make(chan interface{})
+
+			go onConnect(c, threadCloseChan)
 
 			err = c.run()
 			if nil != err {
 				onError(err)
 			}
-			close(closeChan)
+			close(threadCloseChan)
 		}
 	}()
 
