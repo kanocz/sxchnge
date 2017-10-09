@@ -101,6 +101,8 @@ func main() {
 
 		<-closeChan
 		log.Println("Connection closed")
+	}, func(err error) {
+		log.Println("SXError:", err)
 	})
 	if nil != err {
 		log.Fatalln("Error listening:", err)
