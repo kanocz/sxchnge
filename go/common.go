@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"net"
@@ -14,7 +15,11 @@ import (
 
 const (
 	verHI = 1
-	verLO = 0
+	verLO = 1
+)
+
+var (
+	crc32q = crc32.MakeTable(crc32.Koopman)
 )
 
 // CB type for callback function for each type of transfered data
@@ -128,6 +133,8 @@ func (c *Connection) run() error {
 		sbuf [4]byte
 		t    [1]byte
 		msg  = make([]byte, 0, c.MaxSize)
+		crcI uint32
+		crcB = (*[4]byte)(unsafe.Pointer(&crcI))
 	)
 
 	for {
@@ -188,6 +195,16 @@ func (c *Connection) run() error {
 		default:
 		}
 
+		if 0 != size2read {
+			err = readAll(c.conn, (*crcB)[:], 4, c.ReadTimeout)
+			if nil != err {
+				return err
+			}
+			if crc32.Checksum(msg[0:size2read], crc32q) != crcI {
+				return errors.New("crc failed on read")
+			}
+		}
+
 		// we need to allow types that only can be send by one of the side, but also defined
 		if nil != dt.Callback {
 			dt.Callback(msg[0:size2read], c)
@@ -202,6 +219,11 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 	if !ok {
 		return fmt.Errorf("Unknown msg type %d", msgType)
 	}
+
+	var (
+		crcI uint32
+		crcB = (*[4]byte)(unsafe.Pointer(&crcI))
+	)
 
 	header := [5]byte{}
 	header[0] = msgType
@@ -259,6 +281,14 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 	err = writeAll(c.conn, msg, size2write, c.WriteTimeout)
 	if nil != err {
 		return err
+	}
+
+	if size2write > 0 {
+		crcI = crc32.Checksum(msg[0:size2write], crc32q)
+		err = writeAll(c.conn, (*crcB)[:], 4, c.WriteTimeout)
+		if nil != err {
+			return err
+		}
 	}
 
 	return nil
