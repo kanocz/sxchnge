@@ -6,8 +6,8 @@ PREFIX?=/usr
 
 all: libsxchnge.a
 
-libsxchnge.a: sxchnge.o
-	ar rcs libsxchnge.a sxchnge.o
+libsxchnge.a: sxchnge.o crc32.o
+	ar rcs libsxchnge.a sxchnge.o crc32.o
 
 install: all
 	install -d -m 0755 ${DESTDIR}${PREFIX}/lib

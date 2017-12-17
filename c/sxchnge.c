@@ -8,11 +8,12 @@
 
 #include <stdio.h>
 
+#include "crc32.h"
 #include "sxchnge.h"
 
 #define LISTEN_BACKLOG 1024
 #define headerHello                                                            \
-  { 's', 'x', 'c', 'h', 'n', 'g', 1, 0 }
+  { 's', 'x', 'c', 'h', 'n', 'g', 1, 1 }
 
 #define initialPacketSize 1292
 struct initialPacket {
@@ -59,7 +60,7 @@ inline static int loopWrite(int sock, uint8_t *data, size_t len) {
   return 0;
 }
 
-static void prepareInitialPacker(struct initialPacket *ip,
+static void prepareInitialPacket(struct initialPacket *ip,
                                  struct SXConnection *conn) {
   static char header[8] = headerHello;
   for (int i = 0; i < 8; i++)
@@ -80,7 +81,7 @@ static void prepareInitialPacker(struct initialPacket *ip,
 static int connectionInit(int sock, struct SXConnection *conn) {
   char sendBuf[initialPacketSize];
   char recvBuf[initialPacketSize];
-  prepareInitialPacker((struct initialPacket *)sendBuf, conn);
+  prepareInitialPacket((struct initialPacket *)sendBuf, conn);
   if (loopWrite(sock, (uint8_t *)sendBuf, initialPacketSize) < 0)
     return -1;
   if (recv(sock, recvBuf, initialPacketSize, MSG_WAITALL) != initialPacketSize)
@@ -253,6 +254,11 @@ int SXWriteMsg(struct SXConnection *conn, int sock, uint8_t msgType, char *msg,
     return -5;
   if (loopWrite(sock, (uint8_t *)msg, msgLen) < 0)
     return -5;
+  if (msgLen > 0) {
+    u_int32_t crc = crc32c((unsigned char *)msg, msgLen);
+    if (loopWrite(sock, (uint8_t *)(&crc), 4) < 0)
+      return -5;
+  }
 
   return 0;
 }
@@ -300,12 +306,17 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
 
   uint8_t *buf = NULL;
   if (size2read > 0) {
-    buf = malloc(size2read);
+    buf = malloc(size2read+4);
     if (NULL == buf) {
       return -10;
     }
-    if (recv(sock, buf, size2read, MSG_WAITALL) != size2read) {
+    if (recv(sock, buf, size2read+4, MSG_WAITALL) != size2read+4) {
+      free(buf);
       return -2;
+    }
+    if ((*(u_int32_t*)(&buf[size2read])) != crc32c((unsigned char *)buf, size2read)) {
+      free(buf);
+      return -3;
     }
   }
 
