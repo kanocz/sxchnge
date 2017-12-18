@@ -2,6 +2,10 @@ package sxchange
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -19,7 +23,9 @@ const (
 )
 
 var (
-	crc32q = crc32.MakeTable(crc32.Koopman)
+	crc32q          = crc32.MakeTable(crc32.Koopman)
+	errPartialWrite = errors.New("Partial write")
+	errPartialRead  = errors.New("Partial read")
 )
 
 // CB type for callback function for each type of transfered data
@@ -35,6 +41,9 @@ type DataTypeCB struct {
 // Connection informaion both for client or server
 type Connection struct {
 	conn         *net.TCPConn         // real connection
+	AESKey       string               // AES-128/192/256 key in hex for connecton encryption
+	eWriter      *cipher.StreamWriter // just StreamWriter object to simplify encryption
+	eReader      *cipher.StreamReader // the same for reader
 	writeMutex   sync.Mutex           // we need to lock on write operations
 	Types        map[uint8]DataTypeCB // map of type->params&callback
 	KeepAlive    time.Duration        // tcp keep-alive
@@ -56,31 +65,98 @@ type initialPacket struct {
 	FixedSize [256]int32
 }
 
-func readAll(conn *net.TCPConn, buf []byte, size int, timeout time.Duration) error {
+func (c *Connection) readAll(buf []byte, size int, ne bool) error {
 
-	totalDeadline := time.Now().Add(timeout)
-	conn.SetReadDeadline(totalDeadline)
-	i, err := io.ReadFull(conn, buf[:size])
+	totalDeadline := time.Now().Add(c.ReadTimeout)
+	c.conn.SetReadDeadline(totalDeadline)
+
+	var (
+		i   int
+		err error
+	)
+
+	if ne || nil == c.eReader {
+		i, err = io.ReadFull(c.conn, buf[:size])
+	} else {
+		i, err = io.ReadFull(c.eReader, buf[:size])
+	}
+
 	if nil != err {
 		return err
 	}
 	if i != size {
-		return errors.New("Partial read")
+		return errPartialRead
 	}
 
 	return nil
 }
 
-func writeAll(conn *net.TCPConn, buf []byte, size int, timeout time.Duration) error {
-	totalDeadline := time.Now().Add(timeout)
-	conn.SetWriteDeadline(totalDeadline)
-	i, err := conn.Write(buf[:size])
+func (c *Connection) writeAll(buf []byte, size int, ne bool) error {
+	totalDeadline := time.Now().Add(c.WriteTimeout)
+	c.conn.SetWriteDeadline(totalDeadline)
+
+	var (
+		i   int
+		err error
+	)
+
+	if ne || nil == c.eWriter {
+		i, err = c.conn.Write(buf[:size])
+	} else {
+		i, err = c.eWriter.Write(buf[:size])
+	}
 
 	if nil != err {
 		return err
 	}
 	if i != size {
-		return errors.New("Partial write")
+		return errPartialWrite
+	}
+
+	return nil
+}
+
+func (c *Connection) encSetup() error {
+	if "" != c.AESKey {
+		aesKey, err := hex.DecodeString(c.AESKey)
+		if err != nil {
+			return err
+		}
+
+		block, err := aes.NewCipher(aesKey)
+		if err != nil {
+			return err
+		}
+
+		var iv [aes.BlockSize]byte
+		if _, err := io.ReadFull(rand.Reader, iv[:]); nil != err {
+			return err
+		}
+
+		c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
+		i, err := c.conn.Write(iv[:])
+		if nil != err {
+			return err
+		}
+		if i != len(iv) {
+			return errPartialWrite
+		}
+
+		c.eWriter = &cipher.StreamWriter{S: cipher.NewCTR(block, iv[:]), W: c.conn}
+
+		c.conn.SetReadDeadline(time.Now().Add(c.ReadTimeout))
+
+		var ivread [aes.BlockSize]byte
+
+		i, err = io.ReadFull(c.conn, ivread[:])
+		if nil != err {
+			return err
+		}
+		if i != len(ivread) {
+			return errPartialRead
+		}
+
+		c.eReader = &cipher.StreamReader{S: cipher.NewCTR(block, ivread[:]), R: c.conn}
 	}
 
 	return nil
@@ -99,12 +175,12 @@ func (c *Connection) initConnection() error {
 	receivedBuf := (*[initialPacketSize]byte)(unsafe.Pointer(&received))[:]
 
 	// send out version
-	err := writeAll(c.conn, initialBuf, initialPacketSize, c.WriteTimeout)
+	err := c.writeAll(initialBuf, initialPacketSize, true)
 	if nil != err {
 		return err
 	}
 
-	err = readAll(c.conn, receivedBuf, initialPacketSize, c.ReadTimeout)
+	err = c.readAll(receivedBuf, initialPacketSize, true)
 	if nil != err {
 		return err
 	}
@@ -119,6 +195,11 @@ func (c *Connection) initConnection() error {
 
 	if (received.FixedSize != initial.FixedSize) || (received.MaxSize != received.MaxSize) {
 		return errors.New("HS error - different set of datatypes")
+	}
+
+	err = c.encSetup()
+	if nil != err {
+		return err
 	}
 
 	return nil
@@ -145,13 +226,9 @@ func (c *Connection) run() error {
 		default:
 		}
 
-		c.conn.SetReadDeadline(time.Now().Add(c.ReadTimeout))
-		i, err := c.conn.Read(t[:])
+		err := c.readAll(t[:], 1, false)
 		if nil != err {
 			return err
-		}
-		if 0 == i { // TODO: check if this is an error?..
-			continue
 		}
 
 		dt, ok := c.Types[t[0]]
@@ -162,7 +239,7 @@ func (c *Connection) run() error {
 
 		var size2read int
 		if dt.SizeBytes > 0 {
-			err = readAll(c.conn, sbuf[0:dt.SizeBytes], int(dt.SizeBytes), c.ReadTimeout)
+			err = c.readAll(sbuf[0:dt.SizeBytes], int(dt.SizeBytes), false)
 			if nil != err {
 				return err
 			}
@@ -183,7 +260,7 @@ func (c *Connection) run() error {
 			return fmt.Errorf("Structure type %d has invalid SizeBytes setting (%d)", t[0], dt.SizeBytes)
 		}
 
-		err = readAll(c.conn, msg, size2read, c.ReadTimeout)
+		err = c.readAll(msg, size2read, false)
 		if nil != err {
 			return err
 		}
@@ -196,7 +273,7 @@ func (c *Connection) run() error {
 		}
 
 		if 0 != size2read {
-			err = readAll(c.conn, (*crcB)[:], 4, c.ReadTimeout)
+			err = c.readAll((*crcB)[:], 4, false)
 			if nil != err {
 				return err
 			}
@@ -273,19 +350,19 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
 
-	err := writeAll(c.conn, header[:], headerSize, c.WriteTimeout)
+	err := c.writeAll(header[:], headerSize, false)
 	if nil != err {
 		return err
 	}
 
-	err = writeAll(c.conn, msg, size2write, c.WriteTimeout)
+	err = c.writeAll(msg, size2write, false)
 	if nil != err {
 		return err
 	}
 
 	if size2write > 0 {
 		crcI = crc32.Checksum(msg[0:size2write], crc32q)
-		err = writeAll(c.conn, (*crcB)[:], 4, c.WriteTimeout)
+		err = c.writeAll((*crcB)[:], 4, false)
 		if nil != err {
 			return err
 		}
@@ -305,6 +382,9 @@ func (c *Connection) Remote() net.Addr {
 
 func (c *Connection) prepareInitialPacket() initialPacket {
 	result := initialPacket{MaxSize: c.MaxSize, Header: [8]byte{'s', 'x', 'c', 'h', 'n', 'g', verHI, verLO}}
+	if "" != c.AESKey {
+		result.Header[4] = 'E'
+	}
 
 	for i := 0; i < 256; i++ {
 		result.FixedSize[i] = c.Types[uint8(i)].FixedSize

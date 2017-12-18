@@ -64,6 +64,7 @@ func main() {
 		MaxSize:      1024, // for this example even 256 will be enough
 		ReadTimeout:  time.Second * 3,
 		WriteTimeout: time.Second * 3,
+		AESKey:       "00112233445566778899AABBCCDDEEFF",
 		Types: map[uint8]sxchange.DataTypeCB{
 			typePing: sxchange.DataTypeCB{
 				Callback:  pingHandler,
