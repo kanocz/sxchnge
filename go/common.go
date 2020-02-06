@@ -260,6 +260,10 @@ func (c *Connection) run() error {
 			return fmt.Errorf("Structure type %d has invalid SizeBytes setting (%d)", t[0], dt.SizeBytes)
 		}
 
+		if size2read > int(c.MaxSize) {
+			return fmt.Errorf("Size of message is greater than maximum (%d/%d)", size2read, c.MaxSize)
+		}
+
 		err = c.readAll(msg, size2read, false)
 		if nil != err {
 			return err
