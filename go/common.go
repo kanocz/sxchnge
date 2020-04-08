@@ -210,6 +210,12 @@ func (c *Connection) run() error {
 
 	defer c.conn.Close()
 
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("Recovered in sxconnection.run", r)
+		}
+	}()
+
 	var (
 		sbuf [4]byte
 		t    [1]byte
