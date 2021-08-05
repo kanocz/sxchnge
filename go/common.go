@@ -19,7 +19,7 @@ import (
 
 const (
 	verHI = 1
-	verLO = 2
+	verLO = 1
 )
 
 var (
