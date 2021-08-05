@@ -19,7 +19,7 @@ import (
 
 const (
 	verHI = 1
-	verLO = 1
+	verLO = 2
 )
 
 var (
@@ -217,7 +217,7 @@ func (c *Connection) run() error {
 	}()
 
 	var (
-		sbuf [4]byte
+		sbuf [5]byte
 		t    [1]byte
 		msg  = make([]byte, 0, c.MaxSize)
 		crcI uint32
@@ -262,6 +262,8 @@ func (c *Connection) run() error {
 			size2read = int(sbuf[0]) | (int(sbuf[1]) << 8)
 		case 3:
 			size2read = int(sbuf[0]) | (int(sbuf[1]) << 8) | (int(sbuf[2]) << 16)
+		case 4:
+			size2read = int(sbuf[0]) | (int(sbuf[1]) << 8) | (int(sbuf[2]) << 16) | (int(sbuf[3]) << 24)
 		default:
 			return fmt.Errorf("Structure type %d has invalid SizeBytes setting (%d)", t[0], dt.SizeBytes)
 		}
@@ -312,7 +314,7 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 		crcB = (*[4]byte)(unsafe.Pointer(&crcI))
 	)
 
-	header := [5]byte{}
+	header := [6]byte{}
 	header[0] = msgType
 
 	size2write := 0
@@ -341,13 +343,24 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 
 	case 3:
 		if len(msg) > 255*255*255 {
-			return fmt.Errorf("Structure type %d has 2-byte size header but %d bytes givven", msgType, len(msg))
+			return fmt.Errorf("Structure type %d has 3-byte size header but %d bytes givven", msgType, len(msg))
 		}
 		header[1] = byte(len(msg) & 0xff)
 		header[2] = byte((len(msg) & 0xff00) >> 8)
 		header[3] = byte((len(msg) & 0xff0000) >> 16)
 		size2write = len(msg)
 		headerSize = 4
+
+	case 4:
+		if len(msg) > 255*255*255*255 {
+			return fmt.Errorf("Structure type %d has 4-byte size header but %d bytes givven", msgType, len(msg))
+		}
+		header[1] = byte(len(msg) & 0xff)
+		header[2] = byte((len(msg) & 0xff00) >> 8)
+		header[3] = byte((len(msg) & 0xff0000) >> 16)
+		header[4] = byte((len(msg) & 0xff0000) >> 24)
+		size2write = len(msg)
+		headerSize = 5
 
 	default:
 		return fmt.Errorf("Structure type %d has invalid SizeBytes setting (%d)", msgType, dt.SizeBytes)
