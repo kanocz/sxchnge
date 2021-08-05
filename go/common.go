@@ -358,7 +358,7 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 		header[1] = byte(len(msg) & 0xff)
 		header[2] = byte((len(msg) & 0xff00) >> 8)
 		header[3] = byte((len(msg) & 0xff0000) >> 16)
-		header[4] = byte((len(msg) & 0xff0000) >> 24)
+		header[4] = byte((len(msg) & 0xff000000) >> 24)
 		size2write = len(msg)
 		headerSize = 5
 
