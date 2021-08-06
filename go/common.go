@@ -24,8 +24,8 @@ const (
 
 var (
 	crc32q          = crc32.MakeTable(crc32.Koopman)
-	errPartialWrite = errors.New("Partial write")
-	errPartialRead  = errors.New("Partial read")
+	errPartialWrite = errors.New("partial write")
+	errPartialRead  = errors.New("partial read")
 )
 
 // CB type for callback function for each type of transfered data
@@ -118,7 +118,7 @@ func (c *Connection) writeAll(buf []byte, size int, ne bool) error {
 }
 
 func (c *Connection) encSetup() error {
-	if "" != c.AESKey {
+	if c.AESKey != "" {
 		aesKey, err := hex.DecodeString(c.AESKey)
 		if err != nil {
 			return err
@@ -194,7 +194,7 @@ func (c *Connection) initConnection() error {
 		return errors.New("HS error - different message maximal size")
 	}
 
-	if (received.FixedSize != initial.FixedSize) || (received.MaxSize != received.MaxSize) {
+	if (received.FixedSize != initial.FixedSize) || (received.MaxSize != initial.MaxSize) {
 		return errors.New("HS error - different set of datatypes")
 	}
 
@@ -241,7 +241,7 @@ func (c *Connection) run() error {
 		dt, ok := c.Types[t[0]]
 
 		if !ok {
-			return fmt.Errorf("Structure type %d is not defined", t[0])
+			return fmt.Errorf("structure type %d is not defined", t[0])
 		}
 
 		var size2read int
@@ -266,11 +266,11 @@ func (c *Connection) run() error {
 		case 4:
 			size2read = int(sbuf[0]) | (int(sbuf[1]) << 8) | (int(sbuf[2]) << 16) | (int(sbuf[3]) << 24)
 		default:
-			return fmt.Errorf("Structure type %d has invalid SizeBytes setting (%d)", t[0], dt.SizeBytes)
+			return fmt.Errorf("structure type %d has invalid SizeBytes setting (%d)", t[0], dt.SizeBytes)
 		}
 
 		if size2read > int(c.MaxSize) {
-			return fmt.Errorf("Size of message is greater than maximum (%d/%d)", size2read, c.MaxSize)
+			return fmt.Errorf("size of message is greater than maximum (%d/%d)", size2read, c.MaxSize)
 		}
 
 		err = c.readAll(msg, size2read, false)
@@ -285,7 +285,7 @@ func (c *Connection) run() error {
 		default:
 		}
 
-		if 0 != size2read {
+		if size2read != 0 {
 			err = c.readAll((*crcB)[:], 4, false)
 			if nil != err {
 				return err
@@ -307,7 +307,7 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 
 	dt, ok := c.Types[msgType]
 	if !ok {
-		return fmt.Errorf("Unknown msg type %d", msgType)
+		return fmt.Errorf("unknown msg type %d", msgType)
 	}
 
 	var (
@@ -328,14 +328,14 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 		size2write = 0
 	case 1:
 		if len(msg) > 255 {
-			return fmt.Errorf("Structure type %d has 1-byte size header but %d bytes givven", msgType, len(msg))
+			return fmt.Errorf("structure type %d has 1-byte size header but %d bytes givven", msgType, len(msg))
 		}
 		header[1] = byte(len(msg))
 		size2write = len(msg)
 		headerSize = 2
 	case 2:
 		if len(msg) > 255*255 {
-			return fmt.Errorf("Structure type %d has 2-byte size header but %d bytes givven", msgType, len(msg))
+			return fmt.Errorf("structure type %d has 2-byte size header but %d bytes givven", msgType, len(msg))
 		}
 		header[1] = byte(len(msg) & 0xff)
 		header[2] = byte((len(msg) & 0xff00) >> 8)
@@ -344,7 +344,7 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 
 	case 3:
 		if len(msg) > 255*255*255 {
-			return fmt.Errorf("Structure type %d has 3-byte size header but %d bytes givven", msgType, len(msg))
+			return fmt.Errorf("structure type %d has 3-byte size header but %d bytes givven", msgType, len(msg))
 		}
 		header[1] = byte(len(msg) & 0xff)
 		header[2] = byte((len(msg) & 0xff00) >> 8)
@@ -353,9 +353,6 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 		headerSize = 4
 
 	case 4:
-		if len(msg) > 255*255*255*255 {
-			return fmt.Errorf("Structure type %d has 4-byte size header but %d bytes givven", msgType, len(msg))
-		}
 		header[1] = byte(len(msg) & 0xff)
 		header[2] = byte((len(msg) & 0xff00) >> 8)
 		header[3] = byte((len(msg) & 0xff0000) >> 16)
@@ -364,11 +361,11 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 		headerSize = 5
 
 	default:
-		return fmt.Errorf("Structure type %d has invalid SizeBytes setting (%d)", msgType, dt.SizeBytes)
+		return fmt.Errorf("structure type %d has invalid SizeBytes setting (%d)", msgType, dt.SizeBytes)
 	}
 
 	if size2write > len(msg) {
-		return fmt.Errorf("Unable to write %d bytes for structure %d, have only %d in buffer", msgType, size2write, len(msg))
+		return fmt.Errorf("unable to write %d bytes for structure %d, have only %d in buffer", msgType, size2write, len(msg))
 	}
 
 	c.writeMutex.Lock()
@@ -406,7 +403,7 @@ func (c *Connection) Remote() net.Addr {
 
 func (c *Connection) prepareInitialPacket() initialPacket {
 	result := initialPacket{MaxSize: c.MaxSize, Header: [8]byte{'s', 'x', 'c', 'h', 'n', 'g', verHI, verLO}}
-	if "" != c.AESKey {
+	if c.AESKey != "" {
 		result.Header[4] = 'E'
 	}
 
