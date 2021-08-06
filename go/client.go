@@ -1,22 +1,30 @@
 package sxchange
 
 import (
+	"errors"
 	"net"
+)
+
+var (
+	errNonTCP = errors.New("non tcp connection returned")
 )
 
 // Connect to remote server
 func (c *Connection) Connect(address string) error {
 
-	var err error
+	var (
+		err error
+		ok  bool
+	)
 
-	tcpaddr, err := net.ResolveTCPAddr("tcp", address)
+	conn, err := net.DialTimeout("tcp", address, c.ConnectTimeout)
 	if nil != err {
 		return err
 	}
-
-	c.conn, err = net.DialTCP("tcp", nil, tcpaddr)
-	if nil != err {
-		return err
+	c.conn, ok = conn.(*net.TCPConn)
+	if !ok {
+		c.conn = nil
+		return errNonTCP
 	}
 
 	err = c.initConnection()

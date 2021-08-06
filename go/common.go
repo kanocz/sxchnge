@@ -40,18 +40,19 @@ type DataTypeCB struct {
 
 // Connection informaion both for client or server
 type Connection struct {
-	conn         *net.TCPConn         // real connection
-	AESKey       string               // AES-128/192/256 key in hex for connecton encryption
-	eWriter      *cipher.StreamWriter // just StreamWriter object to simplify encryption
-	eReader      *cipher.StreamReader // the same for reader
-	writeMutex   sync.Mutex           // we need to lock on write operations
-	Types        map[uint8]DataTypeCB // map of type->params&callback
-	KeepAlive    time.Duration        // tcp keep-alive
-	ReadTimeout  time.Duration        // we need to receive new message at least once per this duration
-	WriteTimeout time.Duration        // maximal duration for every write operation
-	MaxSize      uint32               // maximum number of bytes for one record/message
-	Ctx          context.Context      // context for some values like server id
-	CloseChan    chan interface{}     // channel for closing incoming messages circle
+	conn           *net.TCPConn         // real connection
+	AESKey         string               // AES-128/192/256 key in hex for connecton encryption
+	eWriter        *cipher.StreamWriter // just StreamWriter object to simplify encryption
+	eReader        *cipher.StreamReader // the same for reader
+	writeMutex     sync.Mutex           // we need to lock on write operations
+	Types          map[uint8]DataTypeCB // map of type->params&callback
+	KeepAlive      time.Duration        // tcp keep-alive
+	ReadTimeout    time.Duration        // we need to receive new message at least once per this duration
+	WriteTimeout   time.Duration        // maximal duration for every write operation
+	ConnectTimeout time.Duration        // maximum duration of net.Dial
+	MaxSize        uint32               // maximum number of bytes for one record/message
+	Ctx            context.Context      // context for some values like server id
+	CloseChan      chan interface{}     // channel for closing incoming messages circle
 }
 
 const (
