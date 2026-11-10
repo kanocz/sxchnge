@@ -23,10 +23,12 @@ struct SXConnection {
   int KeepAlive;
   struct timeval ReadTimeout;
   struct timeval WriteTimeout;
-  uint32_t MaxSize;
+  uint32_t MaxSize; // 0 = no limit (the Go version rejects non-empty messages)
   const char *AESKey; // AES-128/192/256 key in hex; NULL or "" = no encryption
 };
 
+// A non-zero result of SXWriteMsg or SXProcessMsg (a read timeout included)
+// leaves the stream in the middle of a message: close the socket, don't retry.
 int SXInit(void);
 int SXConnect(char *ip, uint16_t port, struct SXConnection *conn);
 int SXListen(uint16_t port, struct SXConnection *conn);

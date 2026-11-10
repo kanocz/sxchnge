@@ -2,6 +2,7 @@ package sxchange
 
 import (
 	"net"
+	"time"
 )
 
 // ListenOne is one-connection server
@@ -24,13 +25,14 @@ func (c *Connection) ListenOne(address string, onConnect func(*Connection, <-cha
 				c.conn.Close()
 			}
 
-			c.conn, err = listener.AcceptTCP()
+			conn, err := listener.AcceptTCP()
 			if nil != err {
 				onError(err)
+				time.Sleep(100 * time.Millisecond) // don't spin on a persistent error (EMFILE)
 				continue
 			}
 
-			err = c.initConnection()
+			err = c.initConnection(conn)
 			if nil != err {
 				onError(err)
 				continue

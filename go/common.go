@@ -28,7 +28,8 @@ var (
 	errPartialRead  = errors.New("partial read")
 )
 
-// CB type for callback function for each type of transfered data
+// CB type for callback function for each type of transfered data.
+// The slice is reused for the next message: copy it if it has to outlive the callback.
 type CB func([]byte, *Connection)
 
 // DataTypeCB describes
@@ -47,10 +48,10 @@ type Connection struct {
 	writeMutex     sync.Mutex           // we need to lock on write operations
 	Types          map[uint8]DataTypeCB // map of type->params&callback
 	KeepAlive      time.Duration        // tcp keep-alive
-	ReadTimeout    time.Duration        // we need to receive new message at least once per this duration
-	WriteTimeout   time.Duration        // maximal duration for every write operation
+	ReadTimeout    time.Duration        // we need to receive new message at least once per this duration; 0 fails every read
+	WriteTimeout   time.Duration        // maximal duration for every write operation; 0 fails every write
 	ConnectTimeout time.Duration        // maximum duration of net.Dial
-	MaxSize        uint32               // maximum number of bytes for one record/message
+	MaxSize        uint32               // maximum number of bytes for one record/message; 0 rejects any non-empty message (the C version treats 0 as "no limit")
 	Ctx            context.Context      // context for some values like server id
 	CloseChan      chan interface{}     // channel for closing incoming messages circle
 }
@@ -163,7 +164,14 @@ func (c *Connection) encSetup() error {
 	return nil
 }
 
-func (c *Connection) initConnection() error {
+func (c *Connection) initConnection(conn *net.TCPConn) error {
+	// WriteMsg from other goroutines must not see a half-initialized connection
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
+
+	c.conn = conn
+	c.eWriter, c.eReader = nil, nil
+
 	if c.KeepAlive != 0 {
 		c.conn.SetKeepAlivePeriod(c.KeepAlive)
 		c.conn.SetKeepAlive(true)
@@ -194,7 +202,7 @@ func (c *Connection) initConnection() error {
 		return errors.New("HS error - different message maximal size")
 	}
 
-	if (received.FixedSize != initial.FixedSize) || (received.MaxSize != initial.MaxSize) {
+	if (received.FixedSize != initial.FixedSize) || (received.SizeBytes != initial.SizeBytes) {
 		return errors.New("HS error - different set of datatypes")
 	}
 
@@ -207,13 +215,14 @@ func (c *Connection) initConnection() error {
 }
 
 // internal run function
-func (c *Connection) run() error {
+func (c *Connection) run() (err error) {
 
 	defer c.conn.Close()
 
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Println("Recovered in sxconnection.run", r)
+			err = fmt.Errorf("panic in sxconnection.run: %v", r)
 		}
 	}()
 
@@ -269,7 +278,8 @@ func (c *Connection) run() error {
 			return fmt.Errorf("structure type %d has invalid SizeBytes setting (%d)", t[0], dt.SizeBytes)
 		}
 
-		if size2read > int(c.MaxSize) {
+		// negative: bad FixedSize, or a 4-byte size on a 32-bit platform
+		if size2read < 0 || size2read > int(c.MaxSize) {
 			return fmt.Errorf("size of message is greater than maximum (%d/%d)", size2read, c.MaxSize)
 		}
 
@@ -334,7 +344,7 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 		size2write = len(msg)
 		headerSize = 2
 	case 2:
-		if len(msg) > 255*255 {
+		if len(msg) > 0xffff {
 			return fmt.Errorf("structure type %d has 2-byte size header but %d bytes givven", msgType, len(msg))
 		}
 		header[1] = byte(len(msg) & 0xff)
@@ -343,7 +353,7 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 		headerSize = 3
 
 	case 3:
-		if len(msg) > 255*255*255 {
+		if len(msg) > 0xffffff {
 			return fmt.Errorf("structure type %d has 3-byte size header but %d bytes givven", msgType, len(msg))
 		}
 		header[1] = byte(len(msg) & 0xff)
@@ -365,7 +375,7 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 	}
 
 	if size2write > len(msg) {
-		return fmt.Errorf("unable to write %d bytes for structure %d, have only %d in buffer", msgType, size2write, len(msg))
+		return fmt.Errorf("unable to write %d bytes for structure %d, have only %d in buffer", size2write, msgType, len(msg))
 	}
 
 	c.writeMutex.Lock()

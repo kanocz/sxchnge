@@ -27,27 +27,49 @@ struct initialPacket {
   uint32_t FixedSizes[256];
 };
 
+// Writing to a socket the peer has closed must return an error, not kill the
+// process with SIGPIPE: Linux takes a send() flag, macOS a socket option.
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+// Idle time before the first keep-alive probe (TCP_KEEPALIVE is the macOS name)
+#if defined(TCP_KEEPIDLE)
+#define SX_KEEPIDLE TCP_KEEPIDLE
+#elif defined(TCP_KEEPALIVE)
+#define SX_KEEPIDLE TCP_KEEPALIVE
+#endif
+
+// The caller owns sock and closes it on failure.
 inline static int setSockOptions(int sock, struct SXConnection *conn) {
   int yes = 1;
   if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(int)) < 0) {
-    close(sock);
     return -5;
   }
+#ifdef SO_NOSIGPIPE
+  if (setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(int)) < 0) {
+    return -5;
+  }
+#endif
 
+#ifdef SX_KEEPIDLE
+  // without it the first probe waits for the system default (7200 s on Linux)
+  if (setsockopt(sock, IPPROTO_TCP, SX_KEEPIDLE, &conn->KeepAlive,
+                 sizeof(int)) < 0) {
+    return -5;
+  }
+#endif
   if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &conn->KeepAlive,
                  sizeof(int)) < 0) {
-    close(sock);
     return -5;
   }
 
   if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &conn->ReadTimeout,
                  sizeof(conn->ReadTimeout)) < 0) {
-    close(sock);
     return -5;
   }
   if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &conn->WriteTimeout,
-                 sizeof(conn->ReadTimeout)) < 0) {
-    close(sock);
+                 sizeof(conn->WriteTimeout)) < 0) {
     return -5;
   }
   return 0;
@@ -55,7 +77,7 @@ inline static int setSockOptions(int sock, struct SXConnection *conn) {
 
 inline static int loopWrite(int sock, const uint8_t *data, size_t len) {
   for (size_t i = 0; i < len;) {
-    ssize_t x = write(sock, data + i, len - i);
+    ssize_t x = send(sock, data + i, len - i, MSG_NOSIGNAL);
     if (x < 0) {
       return -5;
     }
@@ -243,9 +265,13 @@ int SXConnect(char *ip, uint16_t port, struct SXConnection *conn) {
   struct hostent *host;
   host = gethostbyname(ip);
   if (NULL == host) {
+    close(sock);
     return -2;
   }
-  if (1 > host->h_length) {
+  // anything but IPv4 would not fit into sin_addr
+  if (AF_INET != host->h_addrtype ||
+      sizeof(sockaddrin.sin_addr) != (size_t)host->h_length) {
+    close(sock);
     return -3;
   }
 
@@ -253,6 +279,7 @@ int SXConnect(char *ip, uint16_t port, struct SXConnection *conn) {
 
   if (-1 == connect(sock, (struct sockaddr *)&sockaddrin,
                     sizeof(struct sockaddr_in))) {
+    close(sock);
     return -4;
   }
 
@@ -281,6 +308,7 @@ int SXListen(uint16_t port, struct SXConnection *conn) {
   int reuseaddrVal = 1;
   if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuseaddrVal,
                  sizeof(reuseaddrVal)) == -1) {
+    close(sock);
     return -2;
   }
 
@@ -291,10 +319,12 @@ int SXListen(uint16_t port, struct SXConnection *conn) {
   sockaddrin.sin_addr.s_addr = htonl(INADDR_ANY);
 
   if (bind(sock, (struct sockaddr *)&sockaddrin, sizeof(sockaddrin)) < 0) {
+    close(sock);
     return -3;
   }
 
   if (listen(sock, LISTEN_BACKLOG) < 0) {
+    close(sock);
     return -4;
   }
 
@@ -357,7 +387,7 @@ int SXWriteMsg(struct SXConnection *conn, int sock, uint8_t msgType, char *msg,
     headerLen = 2;
     break;
   case 2:
-    if (msgLen > 255 * 255) {
+    if (msgLen > 0xffff) {
       return -3;
     }
     header[1] = (uint8_t)(msgLen & 0xff);
@@ -365,7 +395,7 @@ int SXWriteMsg(struct SXConnection *conn, int sock, uint8_t msgType, char *msg,
     headerLen = 3;
     break;
   case 3:;
-    if (msgLen > 255 * 255) {
+    if (msgLen > 0xffffff) {
       return -3;
     }
     header[1] = (uint8_t)(msgLen & 0xff);
@@ -400,7 +430,9 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
 
   struct SXDataType *dt = conn->SXDataType[msgType];
 
-  if (NULL == dt) {
+  // SizeBytes is local config, but a value above 3 would let the peer write
+  // past sizebuf; 4 is valid in the Go version and not implemented here.
+  if (NULL == dt || dt->SizeBytes < -1 || dt->SizeBytes > 3) {
     return -1;
   }
 
@@ -437,15 +469,18 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
 
   uint8_t *buf = NULL;
   if (size2read > 0) {
-    buf = malloc(size2read+4);
+    size_t total = (size_t)size2read + 4; // payload + crc, no uint32 wrap
+    buf = malloc(total);
     if (NULL == buf) {
       return -10;
     }
-    if (sxRead(sock, buf, size2read+4) < 0) {
+    if (sxRead(sock, buf, total) < 0) {
       free(buf);
       return -2;
     }
-    if ((*(u_int32_t*)(&buf[size2read])) != crc32c((unsigned char *)buf, size2read)) {
+    u_int32_t crc; // the crc is not aligned inside buf
+    memcpy(&crc, buf + size2read, sizeof(crc));
+    if (crc != crc32c((unsigned char *)buf, size2read)) {
       free(buf);
       return -3;
     }

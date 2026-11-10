@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 
+// Koopman polynomial (crc32.Koopman in Go), not Castagnoli despite the name
 u_int32_t crc32c(unsigned char *message, u_int32_t size);
 
 #endif

@@ -1,4 +1,5 @@
 #include "../../sxchnge.h"
+#include <inttypes.h>
 #include <stdio.h>
 
 enum dataType {
@@ -49,7 +50,8 @@ void someDataHandler(void *data, size_t size, int sock,
 
   someData *value = (someData *)data;
 
-  printf("SomeData received: ID: %ld, Value: %f\n", value->ID, value->Value);
+  printf("SomeData received: ID: %" PRIu64 ", Value: %f\n", value->ID,
+         value->Value);
 }
 
 void jsonHandler(void *data, size_t size, int sock, struct SXConnection *conn) {

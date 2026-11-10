@@ -12,24 +12,19 @@ var (
 // Connect to remote server
 func (c *Connection) Connect(address string) error {
 
-	var (
-		err error
-		ok  bool
-	)
-
 	conn, err := net.DialTimeout("tcp", address, c.ConnectTimeout)
 	if nil != err {
 		return err
 	}
-	c.conn, ok = conn.(*net.TCPConn)
+	tcpConn, ok := conn.(*net.TCPConn)
 	if !ok {
-		c.conn = nil
+		conn.Close()
 		return errNonTCP
 	}
 
-	err = c.initConnection()
+	err = c.initConnection(tcpConn)
 	if nil != err {
-		c.conn.Close()
+		tcpConn.Close()
 		return err
 	}
 

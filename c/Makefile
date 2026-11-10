@@ -10,6 +10,6 @@ libsxchnge.a: sxchnge.o crc32.o
 	ar rcs libsxchnge.a sxchnge.o crc32.o
 
 install: all
-	install -d -m 0755 ${DESTDIR}${PREFIX}/lib
+	install -d -m 0755 ${DESTDIR}${PREFIX}/lib ${DESTDIR}${PREFIX}/include
 	install -c -m 0644 libsxchnge.a ${DESTDIR}${PREFIX}/lib
 	install -c -m 0644 sxchnge.h ${DESTDIR}${PREFIX}/include
