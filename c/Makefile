@@ -9,6 +9,10 @@ all: libsxchnge.a
 libsxchnge.a: sxchnge.o crc32.o
 	ar rcs libsxchnge.a sxchnge.o crc32.o
 
+test: libsxchnge.a test.c
+	$(CC) $(CFLAGS) -o sxtest test.c libsxchnge.a $(shell pkg-config --libs libcrypto 2>/dev/null || echo -lcrypto) -lpthread
+	./sxtest
+
 install: all
 	install -d -m 0755 ${DESTDIR}${PREFIX}/lib ${DESTDIR}${PREFIX}/include
 	install -c -m 0644 libsxchnge.a ${DESTDIR}${PREFIX}/lib

@@ -9,8 +9,10 @@ var (
 	errNonTCP = errors.New("non tcp connection returned")
 )
 
-// Connect to remote server
+// Connect to remote server. A previous connection of this Connection is closed.
 func (c *Connection) Connect(address string) error {
+
+	c.Disconnect()
 
 	conn, err := net.DialTimeout("tcp", address, c.ConnectTimeout)
 	if nil != err {
@@ -22,15 +24,13 @@ func (c *Connection) Connect(address string) error {
 		return errNonTCP
 	}
 
-	err = c.initConnection(tcpConn)
+	s, err := c.initConnection(tcpConn)
 	if nil != err {
 		tcpConn.Close()
 		return err
 	}
 
-	c.CloseChan = make(chan interface{})
-
-	go c.run()
+	go c.run(s)
 
 	return nil
 }

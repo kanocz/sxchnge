@@ -1,12 +1,17 @@
+#define _DEFAULT_SOURCE // getaddrinfo and friends under -std=c11 on glibc
+
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -43,25 +48,28 @@ struct initialPacket {
 // The caller owns sock and closes it on failure.
 inline static int setSockOptions(int sock, struct SXConnection *conn) {
   int yes = 1;
-  if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(int)) < 0) {
-    return -5;
-  }
 #ifdef SO_NOSIGPIPE
   if (setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(int)) < 0) {
     return -5;
   }
 #endif
 
+  if (conn->KeepAlive > 0) { // 0 = no keep-alive, as in the Go version
+    if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(int)) < 0) {
+      return -5;
+    }
 #ifdef SX_KEEPIDLE
-  // without it the first probe waits for the system default (7200 s on Linux)
-  if (setsockopt(sock, IPPROTO_TCP, SX_KEEPIDLE, &conn->KeepAlive,
-                 sizeof(int)) < 0) {
-    return -5;
-  }
+    // without it the first probe waits for the system default (7200 s on
+    // Linux)
+    if (setsockopt(sock, IPPROTO_TCP, SX_KEEPIDLE, &conn->KeepAlive,
+                   sizeof(int)) < 0) {
+      return -5;
+    }
 #endif
-  if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &conn->KeepAlive,
-                 sizeof(int)) < 0) {
-    return -5;
+    if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &conn->KeepAlive,
+                   sizeof(int)) < 0) {
+      return -5;
+    }
   }
 
   if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &conn->ReadTimeout,
@@ -79,11 +87,24 @@ inline static int loopWrite(int sock, const uint8_t *data, size_t len) {
   for (size_t i = 0; i < len;) {
     ssize_t x = send(sock, data + i, len - i, MSG_NOSIGNAL);
     if (x < 0) {
+      if (EINTR == errno)
+        continue;
       return -5;
     }
     i += (size_t)x;
   }
   return 0;
+}
+
+// Reads exactly len bytes. A short read (timeout, closed connection, signal
+// in the middle of the data) is an error: with MSG_WAITALL the read timeout
+// covers the whole buffer, so a retry would let a slow peer stretch it.
+inline static int recvAll(int sock, void *buf, size_t len) {
+  ssize_t n;
+  do {
+    n = recv(sock, buf, len, MSG_WAITALL);
+  } while (n < 0 && EINTR == errno); // nothing was read yet
+  return n == (ssize_t)len ? 0 : -1;
 }
 
 // AES-CTR state of one socket, one context per direction. One SXConnection
@@ -164,7 +185,7 @@ static int encSetup(int sock, struct SXConnection *conn) {
   int result = -1;
   if (RAND_bytes(iv, sizeof(iv)) == 1 &&
       loopWrite(sock, iv, sizeof(iv)) == 0 &&
-      recv(sock, peerIV, sizeof(peerIV), MSG_WAITALL) == sizeof(peerIV)) {
+      recvAll(sock, peerIV, sizeof(peerIV)) == 0) {
     ciphers[sock].w = newCTR(cipher, key, iv);
     ciphers[sock].r = newCTR(cipher, key, peerIV);
     if (NULL != ciphers[sock].w && NULL != ciphers[sock].r)
@@ -176,31 +197,24 @@ static int encSetup(int sock, struct SXConnection *conn) {
   return result;
 }
 
-static int sxWrite(int sock, const uint8_t *data, size_t len) {
+// Encrypts buf in place when the socket has a cipher, then sends it.
+static int sxWrite(int sock, uint8_t *buf, size_t len) {
   EVP_CIPHER_CTX *ctx = encFd(sock) ? ciphers[sock].w : NULL;
-  if (NULL == ctx)
-    return loopWrite(sock, data, len);
-
-  uint8_t buf[4096]; // data belongs to the caller, so encrypt into a copy
-  while (len > 0) {
-    int n = len < sizeof(buf) ? (int)len : (int)sizeof(buf);
-    int out;
-    if (EVP_EncryptUpdate(ctx, buf, &out, data, n) != 1 ||
-        loopWrite(sock, buf, (size_t)out) < 0)
-      return -5;
-    data += n;
-    len -= (size_t)n;
-  }
-  return 0;
+  int out;
+  if (NULL != ctx && (len > INT_MAX ||
+                      EVP_EncryptUpdate(ctx, buf, &out, buf, (int)len) != 1))
+    return -5;
+  return loopWrite(sock, buf, len);
 }
 
 static int sxRead(int sock, uint8_t *buf, size_t len) {
-  if (recv(sock, buf, len, MSG_WAITALL) != (ssize_t)len)
+  if (recvAll(sock, buf, len) < 0)
     return -1;
   EVP_CIPHER_CTX *ctx = encFd(sock) ? ciphers[sock].r : NULL;
   int out;
   // CTR decryption is the same keystream XOR as encryption
-  if (NULL != ctx && EVP_EncryptUpdate(ctx, buf, &out, buf, (int)len) != 1)
+  if (NULL != ctx && (len > INT_MAX ||
+                      EVP_EncryptUpdate(ctx, buf, &out, buf, (int)len) != 1))
     return -1;
   return 0;
 }
@@ -231,7 +245,7 @@ static int connectionInit(int sock, struct SXConnection *conn) {
   prepareInitialPacket((struct initialPacket *)sendBuf, conn);
   if (loopWrite(sock, (uint8_t *)sendBuf, initialPacketSize) < 0)
     return -1;
-  if (recv(sock, recvBuf, initialPacketSize, MSG_WAITALL) != initialPacketSize)
+  if (recvAll(sock, recvBuf, initialPacketSize) < 0)
     return -2;
   if (0 != memcmp(sendBuf, recvBuf, initialPacketSize))
     return -3;
@@ -250,36 +264,68 @@ int SXInit(void) {
   return 0;
 }
 
-int SXConnect(char *ip, uint16_t port, struct SXConnection *conn) {
+// Resolves ip:port for TCP, NULL if it fails; free with freeaddrinfo.
+// A NULL ip is the IPv4 wildcard address, for listening.
+static struct addrinfo *resolve(const char *ip, uint16_t port, int flags) {
+  char service[6];
+  snprintf(service, sizeof(service), "%u", (unsigned)port);
+  struct addrinfo hints = {.ai_family = NULL == ip ? AF_INET : AF_UNSPEC,
+                           .ai_socktype = SOCK_STREAM,
+                           .ai_flags = flags};
+  struct addrinfo *res = NULL;
+  return 0 == getaddrinfo(ip, service, &hints, &res) ? res : NULL;
+}
 
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
-  if (-1 == sock) {
+// connect() that gives up after tv; a zero tv keeps the system default.
+static int connectTimeout(int sock, const struct sockaddr *addr,
+                          socklen_t addrlen, const struct timeval *tv) {
+  if (0 == tv->tv_sec && 0 == tv->tv_usec)
+    return connect(sock, addr, addrlen);
+
+  int flags = fcntl(sock, F_GETFL, 0);
+  if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0)
     return -1;
+
+  int rc = connect(sock, addr, addrlen);
+  if (rc < 0 && EINPROGRESS == errno) {
+    struct pollfd pfd = {.fd = sock, .events = POLLOUT};
+    int ms = (int)(tv->tv_sec * 1000 + tv->tv_usec / 1000);
+    int err = 0;
+    socklen_t errlen = sizeof(err);
+    rc = -1;
+    if (1 == poll(&pfd, 1, ms) &&
+        0 == getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &errlen) && 0 == err)
+      rc = 0;
   }
 
-  struct sockaddr_in sockaddrin;
-  bzero(&sockaddrin, sizeof(sockaddrin));
-  sockaddrin.sin_family = AF_INET;
-  sockaddrin.sin_port = htons(port);
+  if (fcntl(sock, F_SETFL, flags) < 0)
+    return -1;
+  return rc;
+}
 
-  struct hostent *host;
-  host = gethostbyname(ip);
-  if (NULL == host) {
-    close(sock);
+int SXConnect(const char *ip, uint16_t port, struct SXConnection *conn) {
+
+  struct addrinfo *res = resolve(ip, port, 0);
+  if (NULL == res) {
     return -2;
   }
-  // anything but IPv4 would not fit into sin_addr
-  if (AF_INET != host->h_addrtype ||
-      sizeof(sockaddrin.sin_addr) != (size_t)host->h_length) {
+
+  int sock = -1;
+  for (struct addrinfo *ai = res; NULL != ai; ai = ai->ai_next) {
+    sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (sock < 0) {
+      continue;
+    }
+    if (0 == connectTimeout(sock, ai->ai_addr, ai->ai_addrlen,
+                            &conn->ConnectTimeout)) {
+      break;
+    }
     close(sock);
-    return -3;
+    sock = -1;
   }
+  freeaddrinfo(res);
 
-  bcopy(host->h_addr_list[0], &sockaddrin.sin_addr, (size_t)host->h_length);
-
-  if (-1 == connect(sock, (struct sockaddr *)&sockaddrin,
-                    sizeof(struct sockaddr_in))) {
-    close(sock);
+  if (sock < 0) {
     return -4;
   }
 
@@ -298,34 +344,33 @@ int SXConnect(char *ip, uint16_t port, struct SXConnection *conn) {
   return 0;
 }
 
-int SXListen(uint16_t port, struct SXConnection *conn) {
+int SXListen(const char *ip, uint16_t port, struct SXConnection *conn) {
 
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
-  if (-1 == sock) {
-    return -1;
-  }
-
-  int reuseaddrVal = 1;
-  if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuseaddrVal,
-                 sizeof(reuseaddrVal)) == -1) {
-    close(sock);
-    return -2;
-  }
-
-  struct sockaddr_in sockaddrin;
-  bzero(&sockaddrin, sizeof(sockaddrin));
-  sockaddrin.sin_family = AF_INET;
-  sockaddrin.sin_port = htons(port);
-  sockaddrin.sin_addr.s_addr = htonl(INADDR_ANY);
-
-  if (bind(sock, (struct sockaddr *)&sockaddrin, sizeof(sockaddrin)) < 0) {
-    close(sock);
+  struct addrinfo *res = resolve(ip, port, AI_PASSIVE);
+  if (NULL == res) {
     return -3;
   }
 
-  if (listen(sock, LISTEN_BACKLOG) < 0) {
-    close(sock);
-    return -4;
+  int result = 0;
+  int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  int reuseaddrVal = 1;
+  if (-1 == sock) {
+    result = -1;
+  } else if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuseaddrVal,
+                        sizeof(reuseaddrVal)) == -1) {
+    result = -2;
+  } else if (bind(sock, res->ai_addr, res->ai_addrlen) < 0) {
+    result = -3;
+  } else if (listen(sock, LISTEN_BACKLOG) < 0) {
+    result = -4;
+  }
+  freeaddrinfo(res);
+
+  if (result < 0) {
+    if (-1 != sock) {
+      close(sock);
+    }
+    return result;
   }
 
   conn->socket = sock;
@@ -334,11 +379,7 @@ int SXListen(uint16_t port, struct SXConnection *conn) {
 }
 
 int SXAccpet(struct SXConnection *conn) {
-  struct sockaddr_in clientaddr;
-  unsigned int clientaddrlen = sizeof(clientaddr);
-
-  int sock =
-      accept(conn->socket, (struct sockaddr *)&clientaddr, &clientaddrlen);
+  int sock = accept(conn->socket, NULL, NULL);
   if (sock < 0) {
     return sock;
   }
@@ -354,6 +395,11 @@ int SXAccpet(struct SXConnection *conn) {
   }
 
   return sock;
+}
+
+int SXClose(int sock) {
+  encReset(sock);
+  return close(sock);
 }
 
 int SXWriteMsg(struct SXConnection *conn, int sock, uint8_t msgType, char *msg,
@@ -407,17 +453,28 @@ int SXWriteMsg(struct SXConnection *conn, int sock, uint8_t msgType, char *msg,
     return -4;
   }
 
-  if (sxWrite(sock, header, headerLen) < 0)
-    return -5;
-  if (sxWrite(sock, (uint8_t *)msg, msgLen) < 0)
-    return -5;
-  if (msgLen > 0) {
-    u_int32_t crc = crc32c((unsigned char *)msg, msgLen);
-    if (sxWrite(sock, (uint8_t *)(&crc), 4) < 0)
-      return -5;
+  // the peer has the same MaxSize and would drop the connection
+  if ((conn->MaxSize > 0) && (msgLen > conn->MaxSize)) {
+    return -3;
   }
 
-  return 0;
+  // One buffer and one send per frame: header, body and crc sent separately
+  // wait for each other's ACK (Nagle against delayed ACK, 40 ms on Linux).
+  size_t frameLen = headerLen + (size_t)msgLen + (msgLen > 0 ? 4 : 0);
+  uint8_t *frame = malloc(frameLen);
+  if (NULL == frame) {
+    return -10;
+  }
+  memcpy(frame, header, headerLen);
+  if (msgLen > 0) {
+    u_int32_t crc = crc32c((unsigned char *)msg, msgLen);
+    memcpy(frame + headerLen, msg, msgLen);
+    memcpy(frame + headerLen + msgLen, &crc, sizeof(crc));
+  }
+
+  int result = sxWrite(sock, frame, frameLen);
+  free(frame);
+  return result;
 }
 
 int SXProcessMsg(struct SXConnection *conn, int sock) {

@@ -98,7 +98,8 @@ int main() {
                                    .Callback = jsonHandler},
           }};
 
-  if (0 != SXListen(3456, &sxconn)) {
+  // NULL listens on every interface, "127.0.0.1" on loopback only
+  if (0 != SXListen(NULL, 3456, &sxconn)) {
     perror("Listen error");
     return -1;
   }
@@ -121,6 +122,9 @@ int main() {
     puts("Processing incomming message...");
     if (0 != SXProcessMsg(&sxconn, sock)) {
       perror("SXProcessMsg");
+      // after any error the stream is unusable: close, don't retry
+      SXClose(sock);
+      SXClose(sxconn.socket);
       return -3;
     }
   }

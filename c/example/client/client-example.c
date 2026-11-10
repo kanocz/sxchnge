@@ -45,6 +45,7 @@ int main() {
       .MaxSize = 1024,
       .ReadTimeout = {.tv_sec = 3, .tv_usec = 0},
       .WriteTimeout = {.tv_sec = 3, .tv_usec = 0},
+      .ConnectTimeout = {.tv_sec = 3, .tv_usec = 0},
       .AESKey = "00112233445566778899AABBCCDDEEFF",
       .SXDataType =
           {
@@ -101,5 +102,6 @@ int main() {
     return -6;
   }
 
+  SXClose(sxconn.socket);
   return 0;
 }
