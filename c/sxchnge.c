@@ -304,6 +304,11 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
     break;
   }
 
+  // MaxSize bounds what an unauthenticated peer can make us allocate per message.
+  if ((conn->MaxSize > 0) && (size2read > conn->MaxSize)) {
+    return -4;
+  }
+
   uint8_t *buf = NULL;
   if (size2read > 0) {
     buf = malloc(size2read+4);
