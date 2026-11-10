@@ -12,6 +12,10 @@ var (
 // Connect to remote server. A previous connection of this Connection is closed.
 func (c *Connection) Connect(address string) error {
 
+	if _, err := c.aesBlock(); nil != err {
+		return err // an invalid AESKey, before any network activity
+	}
+
 	c.Disconnect()
 
 	conn, err := net.DialTimeout("tcp", address, c.ConnectTimeout)
@@ -26,7 +30,6 @@ func (c *Connection) Connect(address string) error {
 
 	s, err := c.initConnection(tcpConn)
 	if nil != err {
-		tcpConn.Close()
 		return err
 	}
 

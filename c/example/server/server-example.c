@@ -67,6 +67,9 @@ void jsonHandler(void *data, size_t size, int sock, struct SXConnection *conn) {
 // needs the library built with "make ENCRYPTION=1".
 int main(int argc, char **argv) {
 
+  // line by line also into a pipe or a file: a log is read while we run
+  setvbuf(stdout, NULL, _IOLBF, 0);
+
   if (SXInit() != 0) {
     puts("SXChange init error");
     return -1;
@@ -88,7 +91,7 @@ int main(int argc, char **argv) {
                                    .SizeBytes = 0,
                                    .FixedSize = 0,
                                    .Callback = pongHandler},
-              &(struct SXDataType){// typeSting
+              &(struct SXDataType){// typeString
                                    .SizeBytes = 1,
                                    .Callback = stringHandler},
               &(struct SXDataType){// typeSomeData
@@ -124,7 +127,7 @@ int main(int argc, char **argv) {
   }
 
   while (1) {
-    puts("Processing incomming message...");
+    puts("Processing incoming message...");
     if (0 != SXProcessMsg(&sxconn, sock)) {
       perror("SXProcessMsg");
       // after any error the stream is unusable: close, don't retry

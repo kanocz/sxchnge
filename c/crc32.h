@@ -1,9 +1,9 @@
-#ifndef __SXCHNGE_CRC32_H__
-#define __SXCHNGE_CRC32_H__
+#ifndef SXCHNGE_CRC32_H
+#define SXCHNGE_CRC32_H
 
-#include <sys/types.h>
+#include <stdint.h>
 
-// Koopman polynomial (crc32.Koopman in Go), not Castagnoli despite the name
-u_int32_t crc32c(unsigned char *message, u_int32_t size);
+// CRC-32 with the Koopman polynomial (crc32.Koopman in Go)
+uint32_t sxCrc32(const unsigned char *message, uint32_t size);
 
 #endif

@@ -37,6 +37,9 @@ void pongHandler(void *data, size_t size, int sock, struct SXConnection *conn) {
 // needs the library built with "make ENCRYPTION=1".
 int main(int argc, char **argv) {
 
+  // line by line also into a pipe or a file: a log is read while we run
+  setvbuf(stdout, NULL, _IOLBF, 0);
+
   if (SXInit() != 0) {
     puts("SXChange init error");
     return -1;
@@ -59,7 +62,7 @@ int main(int argc, char **argv) {
                                    .SizeBytes = 0,
                                    .FixedSize = 0,
                                    .Callback = pongHandler},
-              &(struct SXDataType){.SizeBytes = 1}, // send-only typeSting
+              &(struct SXDataType){.SizeBytes = 1}, // send-only typeString
               &(struct SXDataType){.SizeBytes = -1, // send-only typeSomeData
                                    .FixedSize = sizeof(someData)},
               &(struct SXDataType){.SizeBytes =
@@ -74,7 +77,7 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  puts("Processing incomming message... (waiting for pint from server)");
+  puts("Processing incoming message... (waiting for ping from server)");
   if (0 != SXProcessMsg(&sxconn, sxconn.socket)) {
     perror("SXProcessMsg");
     return -2;
@@ -86,7 +89,7 @@ int main(int argc, char **argv) {
     return -3;
   }
 
-  puts("Processing incomming message...");
+  puts("Processing incoming message...");
   if (0 != SXProcessMsg(&sxconn, sxconn.socket)) {
     perror("SXProcessMsg");
     return -4;
@@ -101,8 +104,8 @@ int main(int argc, char **argv) {
   someData someDataVal = {.ID = 333, .Value = 12.345678};
 
   puts("Sending someData...");
-  if (0 != SXWriteMsg(&sxconn, sxconn.socket, typeSomeData,
-                      (char *)&someDataVal, sizeof(someDataVal))) {
+  if (0 != SXWriteMsg(&sxconn, sxconn.socket, typeSomeData, &someDataVal,
+                      sizeof(someDataVal))) {
     perror("SXWriteMsg");
     return -6;
   }

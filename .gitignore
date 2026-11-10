@@ -26,3 +26,5 @@ c/libsxchnge.a
 c/*.o
 c/example/*/*.o
 c/sxtest
+c/sxtest-addrs
+c/sxtest*.dSYM/

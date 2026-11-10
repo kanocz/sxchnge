@@ -1,6 +1,6 @@
 #include "crc32.h"
 
-static u_int32_t table[256] = {
+static const uint32_t table[256] = {
     0x00000000, 0x9695c4ca, 0xfb4839c9, 0x6dddfd03, 0x20f3c3cf, 0xb6660705,
     0xdbbbfa06, 0x4d2e3ecc, 0x41e7879e, 0xd7724354, 0xbaafbe57, 0x2c3a7a9d,
     0x61144451, 0xf781809b, 0x9a5c7d98, 0x0cc9b952, 0x83cf0f3c, 0x155acbf6,
@@ -45,9 +45,9 @@ static u_int32_t table[256] = {
     0x17206f26, 0x81b5abec, 0x8d7c12be, 0x1be9d674, 0x76342b77, 0xe0a1efbd,
     0xad8fd171, 0x3b1a15bb, 0x56c7e8b8, 0xc0522c72};
 
-u_int32_t crc32c(unsigned char *message, u_int32_t size) {
-  u_int32_t crc = 0xFFFFFFFF;
-  for (u_int32_t i = 0; i < size; i++)
-    crc = (crc >> 8) ^ table[(crc ^ (u_int32_t)(message[i])) & 0xFF];
+uint32_t sxCrc32(const unsigned char *message, uint32_t size) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (uint32_t i = 0; i < size; i++)
+    crc = (crc >> 8) ^ table[(crc ^ (uint32_t)(message[i])) & 0xFF];
   return ~crc;
 }

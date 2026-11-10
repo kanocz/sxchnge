@@ -28,7 +28,7 @@ type someData struct {
 
 func pingHandler(_ []byte, c *sxchange.Connection) {
 	log.Println("Ping received, sending pong")
-	go c.WriteMsg(1, []byte{})
+	go c.WriteMsg(typePong, []byte{})
 }
 
 func pongHandler(_ []byte, _ *sxchange.Connection) {

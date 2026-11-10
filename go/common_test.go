@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -165,6 +167,88 @@ func TestHandshakeBadKey(t *testing.T) {
 		if ra.err == nil || rb.err == nil {
 			t.Fatalf("key %q accepted: %v / %v", key, ra.err, rb.err)
 		}
+
+		// Connect and ListenOne refuse the key before they touch the network
+		c := newConn(key, allTypes(nil))
+		var ne net.Error
+		if err := c.Connect(freeAddr(t)); err == nil || errors.As(err, &ne) {
+			t.Fatalf("Connect with key %q: %v", key, err)
+		}
+		if err := c.ListenOne("127.0.0.1:0", func(*Connection, <-chan interface{}) {}, func(error) {}); err == nil {
+			c.Close()
+			t.Fatalf("ListenOne accepted key %q", key)
+		}
+	}
+}
+
+// A nil callback is refused by ListenOne: the accept goroutine would call it.
+func TestListenOneNilCallbacks(t *testing.T) {
+	onConnect, onError := func(*Connection, <-chan interface{}) {}, func(error) {}
+	c := newConn("", allTypes(nil))
+	if err := c.ListenOne("127.0.0.1:0", nil, onError); err == nil {
+		c.Close()
+		t.Fatal("ListenOne accepted a nil onConnect")
+	}
+	if err := c.ListenOne("127.0.0.1:0", onConnect, nil); err == nil {
+		c.Close()
+		t.Fatal("ListenOne accepted a nil onError")
+	}
+}
+
+// A write that timed out leaves a part of its frame on the wire: the next
+// write must fail and not put a new frame after it.
+func TestWriteAfterFailedWrite(t *testing.T) {
+	a, b := newConn("", allTypes(nil)), newConn("", allTypes(nil))
+	a.MaxSize, b.MaxSize = 64<<20, 64<<20
+	a.WriteTimeout = 200 * time.Millisecond
+	_, sb := connect(t, a, b)
+
+	// nobody reads on the other side, the socket buffers are smaller than this
+	if err := a.WriteMsg(tFour, make([]byte, 64<<20)); err == nil {
+		t.Fatal("64 MB went into a socket that nobody reads")
+	}
+	// the peer takes what was sent: the socket has room for a new frame
+	go io.Copy(io.Discard, sb.conn)
+	time.Sleep(300 * time.Millisecond)
+
+	if err := a.WriteMsg(tOne, []byte("lost")); err == nil {
+		t.Fatal("WriteMsg succeeded after a failed write on the same connection")
+	}
+}
+
+// WriteMsg during the handshake of a silent peer fails at once; it does not
+// wait for the handshake to time out.
+func TestWriteDuringHandshake(t *testing.T) {
+	a := newConn("", allTypes(nil))
+	ca, _ := tcpPair(t) // the other end never answers
+	hsDone := make(chan struct{})
+	go func() {
+		a.initConnection(ca)
+		close(hsDone)
+	}()
+	time.Sleep(50 * time.Millisecond) // let the handshake block in read
+
+	start := time.Now()
+	if err := a.WriteMsg(tOne, []byte("hi")); !errors.Is(err, errNotConnected) {
+		t.Fatalf("got %v, want errNotConnected", err)
+	}
+	if waited := time.Since(start); waited > a.ReadTimeout/2 {
+		t.Fatalf("WriteMsg waited %v for the handshake", waited)
+	}
+	a.Disconnect() // ends the handshake
+	<-hsDone
+}
+
+// A peer that failed the handshake gets no frame: with a key set, the frame
+// would go out before the cipher exists, in the clear.
+func TestNoWriteAfterFailedHandshake(t *testing.T) {
+	a, b := newConn(key128, allTypes(nil)), newConn(key128, allTypes(nil))
+	b.MaxSize++
+	if ra, rb := handshake(t, a, b); ra.err == nil || rb.err == nil {
+		t.Fatalf("handshake accepted the difference: %v / %v", ra.err, rb.err)
+	}
+	if err := a.WriteMsg(tOne, []byte("secret")); err == nil {
+		t.Fatal("WriteMsg wrote to a peer that failed the handshake")
 	}
 }
 
@@ -361,6 +445,46 @@ func TestConcurrentWrites(t *testing.T) {
 	}
 }
 
+// Connect on a connected client whose read loop is inside a callback: the
+// callback of the new connection waits for it.
+func TestCallbacksOneAtATime(t *testing.T) {
+	addr := freeAddr(t)
+	types := func(cb CB) map[uint8]DataTypeCB { return map[uint8]DataTypeCB{tEmpty: {Callback: cb}} }
+
+	server := newConn("", types(nil))
+	err := server.ListenOne(addr, func(c *Connection, _ <-chan interface{}) { c.WriteMsg(tEmpty, nil) }, func(error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	var running, overlaps int32
+	entered := make(chan struct{}, 2)
+	client := newConn("", types(func([]byte, *Connection) {
+		if atomic.AddInt32(&running, 1) > 1 {
+			atomic.AddInt32(&overlaps, 1)
+		}
+		entered <- struct{}{}
+		time.Sleep(200 * time.Millisecond)
+		atomic.AddInt32(&running, -1)
+	}))
+	defer client.Close()
+
+	for i := 0; i < 2; i++ { // the second Connect comes while the first callback sleeps
+		if err := client.Connect(addr); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("callback not called")
+		}
+	}
+	if atomic.LoadInt32(&overlaps) != 0 {
+		t.Fatal("two callbacks ran at the same time")
+	}
+}
+
 // Connect and ListenOne end to end: exchange, reconnect, Disconnect, Close.
 func TestListenOneLifecycle(t *testing.T) {
 	addr := freeAddr(t)
@@ -380,7 +504,7 @@ func TestListenOneLifecycle(t *testing.T) {
 	}
 	defer server.Close()
 
-	if err := server.ListenOne(freeAddr(t), nil, nil); !errors.Is(err, errAlreadyListens) {
+	if err := server.ListenOne(freeAddr(t), func(*Connection, <-chan interface{}) {}, func(error) {}); !errors.Is(err, errAlreadyListens) {
 		t.Fatalf("second ListenOne: %v", err)
 	}
 

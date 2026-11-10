@@ -24,9 +24,9 @@ check() {
   sleep 1
   "$client" $key >"$tmp/client.log" 2>&1 &
   pids="$pids $!"
-  # The C server buffers its output and writes it on exit, which comes with
-  # the read timeout 3 s after the last message.
-  sleep 5
+  # the whole exchange takes a fraction of a second; every program writes its
+  # log line by line
+  sleep 2
   kill $pids 2>/dev/null || true
   wait $pids 2>/dev/null || true
   pids=

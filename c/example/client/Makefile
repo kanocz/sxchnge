@@ -1,13 +1,11 @@
-GIT_VERSION := $(shell git describe --long --dirty --always --tags)
-CFLAGS = -Wall -std=c11 -DGIT_VERSION=\"$(GIT_VERSION)\"
+CFLAGS = -O2 -Wall -Wextra -std=c11
 
 # pass ENCRYPTION=1 when the library was built with it: it then needs libcrypto
 ifeq ($(ENCRYPTION),1)
 LDLIBS = $(shell pkg-config --libs libcrypto 2>/dev/null || echo -lcrypto)
 endif
 
-DESTDIR?=/
-PREFIX?=/usr
+.PHONY: all
 
 all: client-example
 

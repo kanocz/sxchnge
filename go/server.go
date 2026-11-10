@@ -7,7 +7,16 @@ import (
 )
 
 // ListenOne is one-connection server. Close stops it.
+// Both callbacks are required.
 func (c *Connection) ListenOne(address string, onConnect func(*Connection, <-chan interface{}), onError func(err error)) error {
+
+	if nil == onConnect || nil == onError {
+		return errNilCallback // the accept goroutine calls both
+	}
+
+	if _, err := c.aesBlock(); nil != err {
+		return err // an invalid AESKey, not an error on every connection
+	}
 
 	tcpaddr, err := net.ResolveTCPAddr("tcp", address)
 	if nil != err {
@@ -53,7 +62,6 @@ func (c *Connection) ListenOne(address string, onConnect func(*Connection, <-cha
 			}
 
 			if nil != err {
-				conn.Close()
 				onError(err)
 				continue
 			}

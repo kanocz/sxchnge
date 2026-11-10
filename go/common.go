@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 	"unsafe"
@@ -24,37 +25,39 @@ const (
 
 var (
 	crc32q            = crc32.MakeTable(crc32.Koopman)
-	errPartialWrite   = errors.New("partial write")
-	errPartialRead    = errors.New("partial read")
 	errNotConnected   = errors.New("not connected")
 	errAlreadyListens = errors.New("already listening")
+	errNilCallback    = errors.New("onConnect and onError must not be nil")
 )
 
-// CB type for callback function for each type of transfered data.
+// CB type for callback function for each type of transferred data.
 // The slice is reused for the next message: copy it if it has to outlive the callback.
 type CB func([]byte, *Connection)
 
-// DataTypeCB describes
+// DataTypeCB describes one message type: how its size goes over the wire and
+// what to call when a message of this type arrives.
 type DataTypeCB struct {
 	SizeBytes int8  // -1 for fixed size, 0 for no data (ping?), 1 for 0-255 bytes, 2 for 0-65535 bytes...
-	FixedSize int32 // if some struct has fixed fize no other header needed
+	FixedSize int32 // if some struct has fixed size no other header needed
 	Callback  CB    // which function to run after data received
 }
 
-// Connection informaion both for client or server
+// Connection information both for client or server
 type Connection struct {
-	conn           *net.TCPConn         // real connection
+	conn           *net.TCPConn         // real connection, set when its handshake starts
 	listener       *net.TCPListener     // set by ListenOne, cleared by Close
 	done           chan struct{}        // closed by Disconnect/Close: no more callbacks for conn
 	connMutex      sync.Mutex           // guards conn, listener and done
-	AESKey         string               // AES-128/192/256 key in hex for connecton encryption
-	eWriter        *cipher.StreamWriter // just StreamWriter object to simplify encryption
-	writeMutex     sync.Mutex           // we need to lock on write operations
+	AESKey         string               // AES-128/192/256 key in hex for connection encryption
+	wconn          *net.TCPConn         // where WriteMsg writes: conn after its handshake, nil before it and after a failed write
+	wStream        cipher.Stream        // keystream of the outgoing direction, nil without encryption
+	writeMutex     sync.Mutex           // guards wconn and wStream, serializes the frames
+	cbMutex        sync.Mutex           // held while a callback runs
 	Types          map[uint8]DataTypeCB // map of type->params&callback
-	KeepAlive      time.Duration        // tcp keep-alive
+	KeepAlive      time.Duration        // tcp keep-alive: idle time and probe interval; 0 = off
 	ReadTimeout    time.Duration        // we need to receive new message at least once per this duration; 0 fails every read
 	WriteTimeout   time.Duration        // maximal duration for every write operation; 0 fails every write
-	ConnectTimeout time.Duration        // maximum duration of net.Dial
+	ConnectTimeout time.Duration        // maximum duration of net.Dial; 0 = no timeout
 	MaxSize        uint32               // maximum number of bytes for one record/message; 0 rejects any non-empty message (the C version treats 0 as "no limit")
 	Ctx            context.Context      // context for some values like server id
 }
@@ -68,7 +71,7 @@ type session struct {
 }
 
 const (
-	initialPacketSize = 1292 // we need to compare it manualy to be sure that compiler doesn't change aligment!
+	initialPacketSize = 1292 // we need to compare it manually to be sure that compiler doesn't change alignment!
 )
 
 type initialPacket struct {
@@ -85,95 +88,81 @@ func (c *Connection) readAll(conn *net.TCPConn, r io.Reader, buf []byte, size in
 	return err
 }
 
-// writeAll needs writeMutex to be held
-func (c *Connection) writeAll(buf []byte, size int, ne bool) error {
-	totalDeadline := time.Now().Add(c.WriteTimeout)
-	c.conn.SetWriteDeadline(totalDeadline)
-
-	var (
-		i   int
-		err error
-	)
-
-	if ne || nil == c.eWriter {
-		i, err = c.conn.Write(buf[:size])
-	} else {
-		i, err = c.eWriter.Write(buf[:size])
+// writeFrame encrypts frame in place when the connection has a cipher and
+// sends it. It needs writeMutex to be held and wconn to be set.
+func (c *Connection) writeFrame(frame []byte) error {
+	if nil != c.wStream {
+		c.wStream.XORKeyStream(frame, frame)
+	} else if c.AESKey != "" {
+		return errNotConnected // a key without a cipher: never send in the clear
 	}
 
-	if nil != err {
-		return err
-	}
-	if i != size {
-		return errPartialWrite
-	}
-
-	return nil
+	c.wconn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
+	_, err := c.wconn.Write(frame) // a short write comes with an error
+	return err
 }
 
-// encSetup sets the encrypting writer and returns the reader for incoming data
-func (c *Connection) encSetup() (io.Reader, error) {
+// aesBlock returns the cipher for AESKey, nil when encryption is off
+func (c *Connection) aesBlock() (cipher.Block, error) {
 	if c.AESKey == "" {
-		return c.conn, nil
+		return nil, nil
 	}
-
 	aesKey, err := hex.DecodeString(c.AESKey)
 	if err != nil {
 		return nil, err
 	}
+	return aes.NewCipher(aesKey)
+}
 
-	block, err := aes.NewCipher(aesKey)
-	if err != nil {
-		return nil, err
+// encSetup exchanges the IVs. It returns the reader for incoming data and the
+// keystream for outgoing data, which is nil without encryption.
+func (c *Connection) encSetup(conn *net.TCPConn) (io.Reader, cipher.Stream, error) {
+	block, err := c.aesBlock()
+	if nil == block {
+		return conn, nil, err
 	}
 
 	var iv [aes.BlockSize]byte
 	if _, err := io.ReadFull(rand.Reader, iv[:]); nil != err {
-		return nil, err
+		return nil, nil, err
 	}
 
-	c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
-	i, err := c.conn.Write(iv[:])
-	if nil != err {
-		return nil, err
+	conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
+	if _, err := conn.Write(iv[:]); nil != err {
+		return nil, nil, err
 	}
-	if i != len(iv) {
-		return nil, errPartialWrite
-	}
-
-	c.eWriter = &cipher.StreamWriter{S: cipher.NewCTR(block, iv[:]), W: c.conn}
-
-	c.conn.SetReadDeadline(time.Now().Add(c.ReadTimeout))
 
 	var ivread [aes.BlockSize]byte
-
-	i, err = io.ReadFull(c.conn, ivread[:])
-	if nil != err {
-		return nil, err
-	}
-	if i != len(ivread) {
-		return nil, errPartialRead
+	if err := c.readAll(conn, conn, ivread[:], len(ivread)); nil != err {
+		return nil, nil, err
 	}
 
-	return &cipher.StreamReader{S: cipher.NewCTR(block, ivread[:]), R: c.conn}, nil
+	return &cipher.StreamReader{S: cipher.NewCTR(block, ivread[:]), R: conn}, cipher.NewCTR(block, iv[:]), nil
 }
 
-func (c *Connection) initConnection(conn *net.TCPConn) (session, error) {
-	// WriteMsg from other goroutines must not see a half-initialized connection
-	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
+// initConnection does the handshake; on an error it closes conn.
+func (c *Connection) initConnection(conn *net.TCPConn) (s session, err error) {
+	defer func() {
+		if nil != err {
+			conn.Close()
+		}
+	}()
 
-	s := session{conn: conn, done: make(chan struct{})}
+	s = session{conn: conn, done: make(chan struct{})}
+
+	// Until the handshake is done WriteMsg gets errNotConnected. The lock is
+	// not held over the handshake: a silent peer must not block the writers.
+	c.writeMutex.Lock()
+	c.wconn, c.wStream = nil, nil
+	c.writeMutex.Unlock()
 
 	c.connMutex.Lock()
 	c.conn, c.done = conn, s.done
 	c.connMutex.Unlock()
-	c.eWriter = nil
 
-	if c.KeepAlive != 0 {
-		conn.SetKeepAlivePeriod(c.KeepAlive)
-		conn.SetKeepAlive(true)
-	}
+	// Go turns keep-alive on by default, 0 is "off" as in C. Not
+	// SetKeepAlivePeriod: since Go 1.23 it sets the idle time only.
+	conn.SetKeepAliveConfig(net.KeepAliveConfig{Enable: c.KeepAlive != 0, Idle: c.KeepAlive, Interval: c.KeepAlive})
 
 	// initial packets exchange
 	initial := c.prepareInitialPacket()
@@ -182,8 +171,8 @@ func (c *Connection) initConnection(conn *net.TCPConn) (session, error) {
 	receivedBuf := (*[initialPacketSize]byte)(unsafe.Pointer(&received))[:]
 
 	// send out version
-	err := c.writeAll(initialBuf, initialPacketSize, true)
-	if nil != err {
+	conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
+	if _, err = conn.Write(initialBuf); nil != err {
 		return s, err
 	}
 
@@ -204,8 +193,16 @@ func (c *Connection) initConnection(conn *net.TCPConn) (session, error) {
 		return s, errors.New("HS error - different set of datatypes")
 	}
 
-	s.r, err = c.encSetup()
-	return s, err
+	var wStream cipher.Stream
+	s.r, wStream, err = c.encSetup(conn)
+	if nil != err {
+		return s, err
+	}
+
+	c.writeMutex.Lock()
+	c.wconn, c.wStream = conn, wStream
+	c.writeMutex.Unlock()
+	return s, nil
 }
 
 // internal run function
@@ -215,8 +212,7 @@ func (c *Connection) run(s session) (err error) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Println("Recovered in sxconnection.run", r)
-			err = fmt.Errorf("panic in sxconnection.run: %v", r)
+			err = fmt.Errorf("panic in sxconnection.run: %v\n%s", r, debug.Stack())
 			return
 		}
 		select {
@@ -298,18 +294,27 @@ func (c *Connection) run(s session) (err error) {
 			}
 		}
 
-		// one more check - we don't want to call callback after Disconnect or Close
-		select {
-		case <-s.done:
-			return nil
-		default:
-		}
-
 		// we need to allow types that only can be send by one of the side, but also defined
-		if nil != dt.Callback {
-			dt.Callback(msg[0:size2read], c)
+		if nil != dt.Callback && !c.callback(s, dt.Callback, msg[0:size2read]) {
+			return nil
 		}
 	}
+}
+
+// callback calls cb, unless Disconnect or Close has ended the connection: it
+// returns false then. The lock keeps callbacks one at a time: after Connect on
+// a connected client the read loop of the old connection may still be in one.
+func (c *Connection) callback(s session, cb CB, msg []byte) bool {
+	c.cbMutex.Lock()
+	defer c.cbMutex.Unlock() // also when cb panics
+
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
+	cb(msg, c)
+	return true
 }
 
 // WriteMsg creates header and then writes msg buffer via TCP connection
@@ -338,14 +343,14 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 		size2write = 0
 	case 1:
 		if len(msg) > 255 {
-			return fmt.Errorf("structure type %d has 1-byte size header but %d bytes givven", msgType, len(msg))
+			return fmt.Errorf("structure type %d has 1-byte size header but %d bytes given", msgType, len(msg))
 		}
 		header[1] = byte(len(msg))
 		size2write = len(msg)
 		headerSize = 2
 	case 2:
 		if len(msg) > 0xffff {
-			return fmt.Errorf("structure type %d has 2-byte size header but %d bytes givven", msgType, len(msg))
+			return fmt.Errorf("structure type %d has 2-byte size header but %d bytes given", msgType, len(msg))
 		}
 		header[1] = byte(len(msg) & 0xff)
 		header[2] = byte((len(msg) & 0xff00) >> 8)
@@ -354,7 +359,7 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 
 	case 3:
 		if len(msg) > 0xffffff {
-			return fmt.Errorf("structure type %d has 3-byte size header but %d bytes givven", msgType, len(msg))
+			return fmt.Errorf("structure type %d has 3-byte size header but %d bytes given", msgType, len(msg))
 		}
 		header[1] = byte(len(msg) & 0xff)
 		header[2] = byte((len(msg) & 0xff00) >> 8)
@@ -366,7 +371,7 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 		header[1] = byte(len(msg) & 0xff)
 		header[2] = byte((len(msg) & 0xff00) >> 8)
 		header[3] = byte((len(msg) & 0xff0000) >> 16)
-		header[4] = byte((len(msg) & 0xff000000) >> 24)
+		header[4] = byte(len(msg) >> 24) // no 0xff000000 mask: it does not fit a 32-bit int
 		size2write = len(msg)
 		headerSize = 5
 
@@ -396,11 +401,18 @@ func (c *Connection) WriteMsg(msgType uint8, msg []byte) error {
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
 
-	if nil == c.conn {
+	if nil == c.wconn {
 		return errNotConnected
 	}
 
-	return c.writeAll(frame, len(frame), false)
+	if err := c.writeFrame(frame); nil != err {
+		// A part of the frame may be on the wire, and the keystream has moved
+		// on: a frame written after it would be read as garbage.
+		c.wconn.Close()
+		c.wconn = nil
+		return err
+	}
+	return nil
 }
 
 // Disconnect closes the current connection, if any. A blocked read returns at
@@ -441,7 +453,7 @@ func (c *Connection) Close() error {
 	return err
 }
 
-// Remote address retrive
+// Remote address of the current connection, nil before the first one
 func (c *Connection) Remote() net.Addr {
 	c.connMutex.Lock()
 	defer c.connMutex.Unlock()
@@ -469,6 +481,6 @@ func (c *Connection) prepareInitialPacket() initialPacket {
 
 func init() {
 	if initialPacketSize != unsafe.Sizeof(initialPacket{}) {
-		log.Fatalln("Golang uses different aligment withing structure, please modify sxchnge code!")
+		log.Fatalln("Golang uses different alignment within structure, please modify sxchnge code!")
 	}
 }
