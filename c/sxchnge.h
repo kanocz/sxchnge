@@ -24,6 +24,7 @@ struct SXConnection {
   struct timeval ReadTimeout;
   struct timeval WriteTimeout;
   uint32_t MaxSize;
+  const char *AESKey; // AES-128/192/256 key in hex; NULL or "" = no encryption
 };
 
 int SXInit(void);

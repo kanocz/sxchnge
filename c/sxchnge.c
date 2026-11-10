@@ -1,5 +1,9 @@
+#include <ctype.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -49,8 +53,8 @@ inline static int setSockOptions(int sock, struct SXConnection *conn) {
   return 0;
 }
 
-inline static int loopWrite(int sock, uint8_t *data, size_t len) {
-  for (size_t i = 0; i < len; i++) {
+inline static int loopWrite(int sock, const uint8_t *data, size_t len) {
+  for (size_t i = 0; i < len;) {
     ssize_t x = write(sock, data + i, len - i);
     if (x < 0) {
       return -5;
@@ -60,11 +64,132 @@ inline static int loopWrite(int sock, uint8_t *data, size_t len) {
   return 0;
 }
 
+// AES-CTR state of one socket, one context per direction. One SXConnection
+// serves every socket returned by SXAccpet, so the state is keyed by fd.
+// ponytail: fixed table, an encrypted socket needs fd < SX_MAX_ENC_FD; replace
+// with a growable map if a process holds more descriptors than that.
+#define SX_MAX_ENC_FD 65536
+static struct {
+  EVP_CIPHER_CTX *r, *w;
+} ciphers[SX_MAX_ENC_FD];
+
+inline static int encEnabled(struct SXConnection *conn) {
+  return NULL != conn->AESKey && '\0' != conn->AESKey[0];
+}
+
+inline static int encFd(int sock) { return sock >= 0 && sock < SX_MAX_ENC_FD; }
+
+static void encReset(int sock) {
+  if (!encFd(sock))
+    return;
+  EVP_CIPHER_CTX_free(ciphers[sock].r);
+  EVP_CIPHER_CTX_free(ciphers[sock].w);
+  ciphers[sock].r = ciphers[sock].w = NULL;
+}
+
+// Decodes a hex AES key, returns its length in bytes or -1.
+static int parseKey(const char *hex, uint8_t key[32]) {
+  size_t len = strlen(hex);
+  if (len != 32 && len != 48 && len != 64)
+    return -1;
+  for (size_t i = 0; i < len; i += 2) {
+    unsigned int byte;
+    if (!isxdigit((unsigned char)hex[i]) ||
+        !isxdigit((unsigned char)hex[i + 1]) ||
+        sscanf(hex + i, "%2x", &byte) != 1)
+      return -1;
+    key[i / 2] = (uint8_t)byte;
+  }
+  return (int)(len / 2);
+}
+
+static EVP_CIPHER_CTX *newCTR(const EVP_CIPHER *cipher, const uint8_t *key,
+                              const uint8_t *iv) {
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  if (NULL != ctx && EVP_EncryptInit_ex(ctx, cipher, NULL, key, iv) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    ctx = NULL;
+  }
+  return ctx;
+}
+
+// Same exchange as encSetup in go/common.go: each side sends a random IV in
+// the clear and encrypts its outgoing stream with it.
+static int encSetup(int sock, struct SXConnection *conn) {
+  encReset(sock); // the fd may have carried an encrypted connection before
+  if (!encEnabled(conn))
+    return 0;
+  if (!encFd(sock))
+    return -1;
+
+  uint8_t key[32];
+  const EVP_CIPHER *cipher;
+  switch (parseKey(conn->AESKey, key)) {
+  case 16:
+    cipher = EVP_aes_128_ctr();
+    break;
+  case 24:
+    cipher = EVP_aes_192_ctr();
+    break;
+  case 32:
+    cipher = EVP_aes_256_ctr();
+    break;
+  default:
+    return -1;
+  }
+
+  uint8_t iv[16], peerIV[16];
+  int result = -1;
+  if (RAND_bytes(iv, sizeof(iv)) == 1 &&
+      loopWrite(sock, iv, sizeof(iv)) == 0 &&
+      recv(sock, peerIV, sizeof(peerIV), MSG_WAITALL) == sizeof(peerIV)) {
+    ciphers[sock].w = newCTR(cipher, key, iv);
+    ciphers[sock].r = newCTR(cipher, key, peerIV);
+    if (NULL != ciphers[sock].w && NULL != ciphers[sock].r)
+      result = 0;
+    else
+      encReset(sock);
+  }
+  OPENSSL_cleanse(key, sizeof(key));
+  return result;
+}
+
+static int sxWrite(int sock, const uint8_t *data, size_t len) {
+  EVP_CIPHER_CTX *ctx = encFd(sock) ? ciphers[sock].w : NULL;
+  if (NULL == ctx)
+    return loopWrite(sock, data, len);
+
+  uint8_t buf[4096]; // data belongs to the caller, so encrypt into a copy
+  while (len > 0) {
+    int n = len < sizeof(buf) ? (int)len : (int)sizeof(buf);
+    int out;
+    if (EVP_EncryptUpdate(ctx, buf, &out, data, n) != 1 ||
+        loopWrite(sock, buf, (size_t)out) < 0)
+      return -5;
+    data += n;
+    len -= (size_t)n;
+  }
+  return 0;
+}
+
+static int sxRead(int sock, uint8_t *buf, size_t len) {
+  if (recv(sock, buf, len, MSG_WAITALL) != (ssize_t)len)
+    return -1;
+  EVP_CIPHER_CTX *ctx = encFd(sock) ? ciphers[sock].r : NULL;
+  int out;
+  // CTR decryption is the same keystream XOR as encryption
+  if (NULL != ctx && EVP_EncryptUpdate(ctx, buf, &out, buf, (int)len) != 1)
+    return -1;
+  return 0;
+}
+
 static void prepareInitialPacket(struct initialPacket *ip,
                                  struct SXConnection *conn) {
   static char header[8] = headerHello;
   for (int i = 0; i < 8; i++)
     ip->Header[i] = header[i];
+  if (encEnabled(conn))
+    ip->Header[4] = 'E';
   ip->MaxSize = conn->MaxSize;
   for (int i = 0; i < 256; i++) {
     struct SXDataType *dt = conn->SXDataType[i];
@@ -88,6 +213,8 @@ static int connectionInit(int sock, struct SXConnection *conn) {
     return -2;
   if (0 != memcmp(sendBuf, recvBuf, initialPacketSize))
     return -3;
+  if (encSetup(sock, conn) < 0)
+    return -4;
   return 0;
 }
 
@@ -250,13 +377,13 @@ int SXWriteMsg(struct SXConnection *conn, int sock, uint8_t msgType, char *msg,
     return -4;
   }
 
-  if (loopWrite(sock, header, headerLen) < 0)
+  if (sxWrite(sock, header, headerLen) < 0)
     return -5;
-  if (loopWrite(sock, (uint8_t *)msg, msgLen) < 0)
+  if (sxWrite(sock, (uint8_t *)msg, msgLen) < 0)
     return -5;
   if (msgLen > 0) {
     u_int32_t crc = crc32c((unsigned char *)msg, msgLen);
-    if (loopWrite(sock, (uint8_t *)(&crc), 4) < 0)
+    if (sxWrite(sock, (uint8_t *)(&crc), 4) < 0)
       return -5;
   }
 
@@ -267,7 +394,7 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
 
   uint8_t msgType = 0;
 
-  if (recv(sock, &msgType, 1, MSG_WAITALL) != 1) {
+  if (sxRead(sock, &msgType, 1) < 0) {
     return -2;
   }
 
@@ -279,8 +406,7 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
 
   uint8_t sizebuf[4];
   if (dt->SizeBytes > 0) {
-    if (recv(sock, sizebuf, (size_t)dt->SizeBytes, MSG_WAITALL) !=
-        dt->SizeBytes) {
+    if (sxRead(sock, sizebuf, (size_t)dt->SizeBytes) < 0) {
       return -2;
     }
   }
@@ -315,7 +441,7 @@ int SXProcessMsg(struct SXConnection *conn, int sock) {
     if (NULL == buf) {
       return -10;
     }
-    if (recv(sock, buf, size2read+4, MSG_WAITALL) != size2read+4) {
+    if (sxRead(sock, buf, size2read+4) < 0) {
       free(buf);
       return -2;
     }

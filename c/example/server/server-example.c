@@ -73,6 +73,7 @@ int main() {
       .MaxSize = 1024,
       .ReadTimeout = {.tv_sec = 3, .tv_usec = 0},
       .WriteTimeout = {.tv_sec = 3, .tv_usec = 0},
+      .AESKey = "00112233445566778899AABBCCDDEEFF",
       .SXDataType =
           {
               &(struct SXDataType){// typePing

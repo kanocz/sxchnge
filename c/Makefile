@@ -1,5 +1,5 @@
 GIT_VERSION := $(shell git describe --long --dirty --always --tags)
-CFLAGS = -Wall -std=c11 -DGIT_VERSION=\"$(GIT_VERSION)\"
+CFLAGS = -Wall -std=c11 -DGIT_VERSION=\"$(GIT_VERSION)\" $(shell pkg-config --cflags libcrypto 2>/dev/null)
 
 DESTDIR?=/
 PREFIX?=/usr

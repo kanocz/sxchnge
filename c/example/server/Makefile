@@ -7,4 +7,4 @@ PREFIX?=/usr
 all: server-example
 
 server-example: server-example.o
-	gcc -o server-example server-example.o ../../libsxchnge.a
+	gcc -o server-example server-example.o ../../libsxchnge.a $(shell pkg-config --libs libcrypto 2>/dev/null || echo -lcrypto)
