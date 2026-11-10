@@ -33,7 +33,9 @@ void pongHandler(void *data, size_t size, int sock, struct SXConnection *conn) {
   puts("Pong received");
 }
 
-int main() {
+// The optional argument is an AES key in hex, the same as on the server; it
+// needs the library built with "make ENCRYPTION=1".
+int main(int argc, char **argv) {
 
   if (SXInit() != 0) {
     puts("SXChange init error");
@@ -46,7 +48,7 @@ int main() {
       .ReadTimeout = {.tv_sec = 3, .tv_usec = 0},
       .WriteTimeout = {.tv_sec = 3, .tv_usec = 0},
       .ConnectTimeout = {.tv_sec = 3, .tv_usec = 0},
-      .AESKey = "00112233445566778899AABBCCDDEEFF",
+      .AESKey = argc > 1 ? argv[1] : NULL,
       .SXDataType =
           {
               &(struct SXDataType){// typePing
@@ -64,8 +66,11 @@ int main() {
                                        2}, // send-only typeSomeDataJson
           }};
 
-  if (0 != SXConnect("127.0.0.1", 3456, &sxconn)) {
-    perror("Connection error");
+  int rc = SXConnect("127.0.0.1", 3456, &sxconn);
+  if (0 != rc) {
+    printf("SXConnect returned %d: ", rc); // the codes are in sxchnge.h
+    fflush(stdout);
+    perror("");
     return -1;
   }
 

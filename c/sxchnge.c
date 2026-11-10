@@ -6,9 +6,6 @@
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
-#include <openssl/rand.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +16,14 @@
 
 #include "crc32.h"
 #include "sxchnge.h"
+
+// AES support is optional: without SX_ENCRYPTION the library does not need
+// OpenSSL and refuses a connection that has AESKey set.
+#ifdef SX_ENCRYPTION
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#endif
 
 #define LISTEN_BACKLOG 1024
 #define headerHello                                                            \
@@ -107,6 +112,13 @@ inline static int recvAll(int sock, void *buf, size_t len) {
   return n == (ssize_t)len ? 0 : -1;
 }
 
+inline static int encEnabled(struct SXConnection *conn) {
+  return NULL != conn->AESKey && '\0' != conn->AESKey[0];
+}
+
+#ifdef SX_ENCRYPTION
+#define encSupported 1
+
 // AES-CTR state of one socket, one context per direction. One SXConnection
 // serves every socket returned by SXAccpet, so the state is keyed by fd.
 // ponytail: fixed table, an encrypted socket needs fd < SX_MAX_ENC_FD; replace
@@ -115,10 +127,6 @@ inline static int recvAll(int sock, void *buf, size_t len) {
 static struct {
   EVP_CIPHER_CTX *r, *w;
 } ciphers[SX_MAX_ENC_FD];
-
-inline static int encEnabled(struct SXConnection *conn) {
-  return NULL != conn->AESKey && '\0' != conn->AESKey[0];
-}
 
 inline static int encFd(int sock) { return sock >= 0 && sock < SX_MAX_ENC_FD; }
 
@@ -197,12 +205,40 @@ static int encSetup(int sock, struct SXConnection *conn) {
   return result;
 }
 
+// XORs buf in place with the keystream of one direction of the socket; does
+// nothing for a plain socket. CTR decryption is the same XOR as encryption.
+static int encCrypt(int sock, int write, uint8_t *buf, size_t len) {
+  EVP_CIPHER_CTX *ctx = NULL;
+  if (encFd(sock))
+    ctx = write ? ciphers[sock].w : ciphers[sock].r;
+  int out;
+  if (NULL == ctx)
+    return 0;
+  if (len > INT_MAX || EVP_EncryptUpdate(ctx, buf, &out, buf, (int)len) != 1)
+    return -1;
+  return 0;
+}
+
+#else // no SX_ENCRYPTION
+#define encSupported 0
+
+static void encReset(int sock) { (void)sock; }
+
+static int encSetup(int sock, struct SXConnection *conn) {
+  (void)sock;
+  return encEnabled(conn) ? -1 : 0;
+}
+
+static int encCrypt(int sock, int write, uint8_t *buf, size_t len) {
+  (void)sock, (void)write, (void)buf, (void)len;
+  return 0;
+}
+
+#endif
+
 // Encrypts buf in place when the socket has a cipher, then sends it.
 static int sxWrite(int sock, uint8_t *buf, size_t len) {
-  EVP_CIPHER_CTX *ctx = encFd(sock) ? ciphers[sock].w : NULL;
-  int out;
-  if (NULL != ctx && (len > INT_MAX ||
-                      EVP_EncryptUpdate(ctx, buf, &out, buf, (int)len) != 1))
+  if (encCrypt(sock, 1, buf, len) < 0)
     return -5;
   return loopWrite(sock, buf, len);
 }
@@ -210,13 +246,7 @@ static int sxWrite(int sock, uint8_t *buf, size_t len) {
 static int sxRead(int sock, uint8_t *buf, size_t len) {
   if (recvAll(sock, buf, len) < 0)
     return -1;
-  EVP_CIPHER_CTX *ctx = encFd(sock) ? ciphers[sock].r : NULL;
-  int out;
-  // CTR decryption is the same keystream XOR as encryption
-  if (NULL != ctx && (len > INT_MAX ||
-                      EVP_EncryptUpdate(ctx, buf, &out, buf, (int)len) != 1))
-    return -1;
-  return 0;
+  return encCrypt(sock, 0, buf, len);
 }
 
 static void prepareInitialPacket(struct initialPacket *ip,
@@ -305,6 +335,10 @@ static int connectTimeout(int sock, const struct sockaddr *addr,
 
 int SXConnect(const char *ip, uint16_t port, struct SXConnection *conn) {
 
+  if (!encSupported && encEnabled(conn)) {
+    return -7;
+  }
+
   struct addrinfo *res = resolve(ip, port, 0);
   if (NULL == res) {
     return -2;
@@ -346,6 +380,11 @@ int SXConnect(const char *ip, uint16_t port, struct SXConnection *conn) {
 
 int SXListen(const char *ip, uint16_t port, struct SXConnection *conn) {
 
+  // fail at startup, not on every accepted connection
+  if (!encSupported && encEnabled(conn)) {
+    return -7;
+  }
+
   struct addrinfo *res = resolve(ip, port, AI_PASSIVE);
   if (NULL == res) {
     return -3;
@@ -379,6 +418,10 @@ int SXListen(const char *ip, uint16_t port, struct SXConnection *conn) {
 }
 
 int SXAccpet(struct SXConnection *conn) {
+  if (!encSupported && encEnabled(conn)) {
+    return -7;
+  }
+
   int sock = accept(conn->socket, NULL, NULL);
   if (sock < 0) {
     return sock;

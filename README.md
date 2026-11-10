@@ -3,7 +3,9 @@ Easy exchange struct and plain data via TCP between golang and C
 
 Protocol providing handshake on connect, AES-CTR encryption, comparing version and list of datatypes, sizes etc
 
-Encryption is enabled by setting `AESKey` (AES-128/192/256 key in hex) to the same value on both sides. The C version uses OpenSSL libcrypto, link your program with `-lcrypto`.
+Encryption is enabled by setting `AESKey` (AES-128/192/256 key in hex) to the same value on both sides.
+
+The C version is built without encryption by default and then has no dependencies. Build it with `make ENCRYPTION=1` (the compiler flag `-DSX_ENCRYPTION`) to get AES support; that build uses OpenSSL libcrypto, link your program with `-lcrypto`.
 
 ## Rules for both versions
 
@@ -54,6 +56,17 @@ SXClose(sock);
 - Close the sockets with `SXClose`, not `close`: it also frees the AES state of the socket.
 - An encrypted socket needs a descriptor below 65536.
 
+Build options:
+
+| Command | Result |
+| --- | --- |
+| `make -C c` | no encryption, no OpenSSL; `SXConnect`, `SXListen` and `SXAccpet` return `-7` when `AESKey` is set |
+| `make -C c ENCRYPTION=1` | AES support, needs the OpenSSL headers and `-lcrypto` at link time |
+
+`make` does not notice a changed `ENCRYPTION`: add `-B` when switching. `struct SXConnection` is the same in both builds, so the define is needed only for `sxchnge.c`, not for the code that includes `sxchnge.h`.
+
+All four example programs take the AES key as an optional argument, for example `server-example 00112233445566778899AABBCCDDEEFF`.
+
 ## Changes after v1.1.3 that need attention in the calling code
 
 The wire format is the same: old and new versions talk to each other.
@@ -69,6 +82,7 @@ Go:
 
 C:
 
+- Encryption is compiled in only with `-DSX_ENCRYPTION` (`make ENCRYPTION=1`). A program that sets `AESKey` and links a library built without it gets `-7` from `SXConnect`, `SXListen` and `SXAccpet`.
 - `SXListen(port, conn)` became `SXListen(ip, port, conn)`. Pass `NULL` as `ip` for the old behaviour.
 - `SXClose(sock)` is new. Replace `close()` on sockets from `SXConnect`, `SXAccpet` and `SXListen` with it.
 - `struct SXConnection` has a new last field `ConnectTimeout`; zero keeps the system default. The struct grew, so recompile everything that includes the header.
@@ -83,7 +97,8 @@ C:
 ## Tests
 
 ```sh
-go test -race ./go/     # Go library
-make -C c test          # C library
-./interop-test.sh       # C and Go examples against each other, needs port 3456
+go test -race ./go/              # Go library
+make -B -C c test                # C library without encryption
+make -B -C c ENCRYPTION=1 test   # C library with encryption
+./interop-test.sh                # C and Go examples against each other, plain and encrypted; needs port 3456
 ```

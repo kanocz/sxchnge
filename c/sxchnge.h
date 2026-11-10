@@ -28,12 +28,18 @@ struct SXConnection {
   struct timeval ReadTimeout;
   struct timeval WriteTimeout;
   uint32_t MaxSize; // 0 = no limit (the Go version rejects non-empty messages)
-  const char *AESKey; // AES-128/192/256 key in hex; NULL or "" = no encryption
+  // AES-128/192/256 key in hex; NULL or "" = no encryption. A key needs the
+  // library compiled with -DSX_ENCRYPTION (make ENCRYPTION=1), which links
+  // OpenSSL libcrypto. The struct is the same in both builds.
+  const char *AESKey;
   struct timeval ConnectTimeout; // for SXConnect; 0 = system default
 };
 
 // Returns 0, or -1 if the compiler lays out the handshake packet differently.
 int SXInit(void);
+
+// SXConnect, SXListen and SXAccpet return -7 when AESKey is set and the
+// library was compiled without SX_ENCRYPTION.
 
 // Connects and does the handshake, the socket is in conn->socket.
 // -2 host not resolved, -4 no address connected, -5 socket options,
@@ -46,7 +52,7 @@ int SXConnect(const char *ip, uint16_t port, struct SXConnection *conn);
 int SXListen(const char *ip, uint16_t port, struct SXConnection *conn);
 
 // Accepts one connection and does the handshake. Returns the socket,
-// or a negative value: -5 socket options, -6 handshake, other: accept failed.
+// or a negative value: -5 socket options, -6 handshake, -1: accept failed.
 int SXAccpet(struct SXConnection *conn);
 
 // Closes a socket returned by SXConnect, SXAccpet or SXListen and frees its

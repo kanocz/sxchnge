@@ -59,12 +59,18 @@ func someDataJSONHandler(value []byte, c *sxchange.Connection) {
 }
 
 func main() {
+	// the optional argument is an AES key in hex, the same as on the client
+	key := ""
+	if len(os.Args) > 1 {
+		key = os.Args[1]
+	}
+
 	connection := sxchange.Connection{
 		KeepAlive:    time.Second * 10,
 		MaxSize:      1024, // for this example even 256 will be enough
 		ReadTimeout:  time.Second * 3,
 		WriteTimeout: time.Second * 3,
-		AESKey:       "00112233445566778899AABBCCDDEEFF",
+		AESKey:       key,
 		Types: map[uint8]sxchange.DataTypeCB{
 			typePing: sxchange.DataTypeCB{
 				Callback:  pingHandler,

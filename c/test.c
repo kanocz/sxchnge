@@ -1,5 +1,6 @@
 // Tests of the C library: a server in the main thread and a client in a second
-// thread talk over loopback. Run with "make test".
+// thread talk over loopback. Run with "make -B test" and with
+// "make -B ENCRYPTION=1 test": the two builds test different things.
 #define _DEFAULT_SOURCE
 
 #include "sxchnge.h"
@@ -179,14 +180,15 @@ static void expectHandshakeFailure(struct SXConnection srv,
 }
 
 static void testHandshakeMismatch(void) {
-  struct SXConnection cli = mkConn(cliTypes, KEY128);
+  struct SXConnection cli = mkConn(cliTypes, NULL);
   cli.SXDataType[tOne] = &otherSizeType;
-  expectHandshakeFailure(mkConn(srvTypes, KEY128), cli); // SizeBytes
+  expectHandshakeFailure(mkConn(srvTypes, NULL), cli); // SizeBytes
 
-  cli = mkConn(cliTypes, KEY128);
+  cli = mkConn(cliTypes, NULL);
   cli.MaxSize++;
-  expectHandshakeFailure(mkConn(srvTypes, KEY128), cli); // MaxSize
+  expectHandshakeFailure(mkConn(srvTypes, NULL), cli); // MaxSize
 
+#ifdef SX_ENCRYPTION
   expectHandshakeFailure(mkConn(srvTypes, KEY128),
                          mkConn(cliTypes, NULL)); // encryption on one side
 
@@ -194,6 +196,7 @@ static void testHandshakeMismatch(void) {
                          mkConn(cliTypes, "zz")); // not a key
   expectHandshakeFailure(mkConn(srvTypes, KEY128 "00"),
                          mkConn(cliTypes, KEY128 "00")); // 17 bytes
+#endif
 }
 
 // --- frames the server has to refuse
@@ -238,6 +241,8 @@ static void testRefusedFrames(void) {
   expectRefusal(truncated, sizeof(truncated), -2);
 }
 
+#ifdef SX_ENCRYPTION
+
 // --- a message encrypted with another key is not accepted
 
 static struct SXDataType onlySized = {2, 0, NULL};
@@ -264,6 +269,28 @@ static void testWrongKey(void) {
   finish(&srv, &cl, sock);
 }
 
+static void testEncryption(void) {
+  testRoundTrip(KEY128);
+  testRoundTrip(KEY192);
+  testRoundTrip(KEY256);
+  testWrongKey();
+}
+
+#else
+
+// --- a library built without SX_ENCRYPTION refuses a key before any I/O
+
+static void testEncryption(void) {
+  struct SXConnection conn = mkConn(srvTypes, KEY128);
+  conn.socket = -1;
+  CHECK(-7 == SXListen("127.0.0.1", 0, &conn));
+  CHECK(-7 == SXConnect("127.0.0.1", 1, &conn));
+  CHECK(-7 == SXAccpet(&conn));
+  CHECK(-1 == conn.socket); // nothing was opened
+}
+
+#endif
+
 // --- SXWriteMsg refuses what the peer could not read; nothing is sent
 
 static void testWriteLimits(void) {
@@ -282,8 +309,8 @@ static void testWriteLimits(void) {
 // --- writing to a connection closed by the peer is an error, not SIGPIPE
 
 static void testWriteToClosedPeer(void) {
-  struct SXConnection srv = mkConn(srvTypes, KEY128);
-  struct client cl = {.conn = mkConn(cliTypes, KEY128), .fn = noop};
+  struct SXConnection srv = mkConn(srvTypes, NULL);
+  struct client cl = {.conn = mkConn(cliTypes, NULL), .fn = noop};
 
   int sock = start(&srv, &cl);
   CHECK(sock >= 0);
@@ -349,12 +376,9 @@ int main(void) {
 
   CHECK(0 == SXInit());
   testRoundTrip(NULL);
-  testRoundTrip(KEY128);
-  testRoundTrip(KEY192);
-  testRoundTrip(KEY256);
+  testEncryption();
   testHandshakeMismatch();
   testRefusedFrames();
-  testWrongKey();
   testWriteLimits();
   testWriteToClosedPeer();
   testReadTimeout();
@@ -364,6 +388,10 @@ int main(void) {
     printf("%d checks FAILED\n", failures);
     return 1;
   }
-  puts("C tests OK");
+#ifdef SX_ENCRYPTION
+  puts("C tests OK (with encryption)");
+#else
+  puts("C tests OK (without encryption)");
+#endif
   return 0;
 }

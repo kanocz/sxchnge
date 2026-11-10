@@ -63,7 +63,9 @@ void jsonHandler(void *data, size_t size, int sock, struct SXConnection *conn) {
   printf("JSON received: %.*s\n", (int)size, (char *)data);
 }
 
-int main() {
+// The optional argument is an AES key in hex, the same as on the client; it
+// needs the library built with "make ENCRYPTION=1".
+int main(int argc, char **argv) {
 
   if (SXInit() != 0) {
     puts("SXChange init error");
@@ -75,7 +77,7 @@ int main() {
       .MaxSize = 1024,
       .ReadTimeout = {.tv_sec = 3, .tv_usec = 0},
       .WriteTimeout = {.tv_sec = 3, .tv_usec = 0},
-      .AESKey = "00112233445566778899AABBCCDDEEFF",
+      .AESKey = argc > 1 ? argv[1] : NULL,
       .SXDataType =
           {
               &(struct SXDataType){// typePing
@@ -99,8 +101,11 @@ int main() {
           }};
 
   // NULL listens on every interface, "127.0.0.1" on loopback only
-  if (0 != SXListen(NULL, 3456, &sxconn)) {
-    perror("Listen error");
+  int rc = SXListen(NULL, 3456, &sxconn);
+  if (0 != rc) {
+    printf("SXListen returned %d: ", rc); // the codes are in sxchnge.h
+    fflush(stdout);
+    perror("");
     return -1;
   }
 
