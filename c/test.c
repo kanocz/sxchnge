@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -27,7 +28,7 @@ static int failures;
     }                                                                          \
   } while (0)
 
-enum { tEmpty, tOne, tTwo, tThree, tFixed, tCount, tBad = 9 };
+enum { tEmpty, tOne, tTwo, tThree, tFixed, tFour, tCount, tBad = 9 };
 #define FIXED 16
 #define MAXSIZE 100000
 #define KEY128 "00112233445566778899AABBCCDDEEFF"
@@ -72,13 +73,14 @@ static void cliCB(void *data, size_t size, int sock, struct SXConnection *c) {
 }
 
 static struct SXDataType srvTypes[tCount] = {
-    {0, 0, srvCB}, {1, 0, srvCB}, {2, 0, srvCB}, {3, 0, srvCB},
-    {-1, FIXED, srvCB}};
+    {0, 0, srvCB}, {1, 0, srvCB},      {2, 0, srvCB},
+    {3, 0, srvCB}, {-1, FIXED, srvCB}, {4, 0, srvCB}};
 static struct SXDataType cliTypes[tCount] = {
-    {0, 0, cliCB}, {1, 0, cliCB}, {2, 0, cliCB}, {3, 0, cliCB},
-    {-1, FIXED, cliCB}};
+    {0, 0, cliCB}, {1, 0, cliCB},      {2, 0, cliCB},
+    {3, 0, cliCB}, {-1, FIXED, cliCB}, {4, 0, cliCB}};
 static struct SXDataType badType = {5, 0, NULL};        // invalid SizeBytes
 static struct SXDataType otherSizeType = {2, 0, NULL};  // tOne with SizeBytes 2
+static struct SXDataType noDataType = {0, 0, NULL};
 
 static struct SXConnection mkConn(struct SXDataType *types, const char *key) {
   struct SXConnection c = {.KeepAlive = 5,
@@ -139,8 +141,9 @@ static void finish(struct SXConnection *srv, struct client *cl, int sock) {
 static const struct {
   uint8_t type;
   uint32_t size;
-} roundTripMsgs[] = {{tEmpty, 0},     {tOne, 0},        {tOne, 255},
-                     {tTwo, 0xffff},  {tThree, 70000},  {tFixed, FIXED}};
+} roundTripMsgs[] = {{tEmpty, 0},     {tOne, 0},       {tOne, 255},
+                     {tTwo, 0xffff},  {tThree, 70000}, {tFour, 70000},
+                     {tFixed, FIXED}};
 #define ROUNDTRIP_COUNT (int)(sizeof(roundTripMsgs) / sizeof(roundTripMsgs[0]))
 
 static int roundTripClient(struct SXConnection *conn, int sock) {
@@ -210,6 +213,11 @@ static void testHandshakeMismatch(void) {
   cli.MaxSize++;
   expectHandshakeFailure(mkConn(srvTypes, NULL), cli); // MaxSize
 
+  cli = mkConn(cliTypes, NULL);
+  cli.SXDataType[200] = &noDataType;
+  // a type without data on one side only
+  expectHandshakeFailure(mkConn(srvTypes, NULL), cli);
+
 #ifdef SX_ENCRYPTION
   expectHandshakeFailure(mkConn(srvTypes, KEY128),
                          mkConn(cliTypes, NULL)); // encryption on one side
@@ -270,30 +278,153 @@ static void testDuplex(const char *key);
 
 #ifdef SX_ENCRYPTION
 
-// --- a message encrypted with another key is not accepted
-
-static struct SXDataType onlySized = {2, 0, NULL};
-
-static int sizedClient(struct SXConnection *conn, int sock) {
-  return SXWriteMsg(conn, sock, 0, pattern, 100);
-}
+// --- another key fails the handshake on both sides
 
 static void testWrongKey(void) {
-  // only a sized type: a zero-size one would pass for 1 of 256 garbage bytes
-  struct SXConnection srv = {.KeepAlive = 5,
-                             .MaxSize = MAXSIZE,
-                             .ReadTimeout = {.tv_usec = 300000},
-                             .WriteTimeout = {.tv_sec = 2},
-                             .AESKey = KEY128,
-                             .SXDataType = {&onlySized}};
-  struct client cl = {.conn = srv, .fn = sizedClient};
-  cl.conn.AESKey = "01112233445566778899AABBCCDDEEFF";
-
-  int sock = start(&srv, &cl); // the handshake does not check the key
-  CHECK(sock >= 0);
-  if (sock >= 0)
-    CHECK(0 != SXProcessMsg(&srv, sock));
+  struct SXConnection srv = mkConn(srvTypes, KEY128);
+  struct client cl = {.conn = mkConn(cliTypes, "01112233445566778899AABBCCDDEEFF"),
+                      .fn = noop};
+  int sock = start(&srv, &cl);
+  CHECK(-9 == sock);
   finish(&srv, &cl, sock);
+  CHECK(-9 == cl.connectRc);
+}
+
+// --- a peer without the key that sends back what it gets does not pass the
+// handshake (it did in protocol 1.1)
+
+#define HELLO 1324
+#define CONFIRM 16
+
+static int tcpConnect(uint16_t port) {
+  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in addr = {.sin_family = AF_INET,
+                             .sin_port = htons(port),
+                             .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  CHECK(0 == connect(sock, (struct sockaddr *)&addr, sizeof(addr)));
+  return sock;
+}
+
+struct echo {
+  uint16_t port;
+  uint8_t hello[HELLO]; // of the server
+};
+
+static void *echoMain(void *arg) {
+  struct echo *e = arg;
+  uint8_t confirm[CONFIRM];
+  int sock = tcpConnect(e->port);
+  if (recv(sock, e->hello, HELLO, MSG_WAITALL) == HELLO &&
+      send(sock, e->hello, HELLO, 0) == HELLO &&
+      recv(sock, confirm, CONFIRM, MSG_WAITALL) == CONFIRM)
+    send(sock, confirm, CONFIRM, 0);
+  close(sock);
+  return NULL;
+}
+
+static void testHelloEcho(void) {
+  struct SXConnection srv = mkConn(srvTypes, KEY128);
+  struct echo e[2];
+  CHECK(0 == SXListen("127.0.0.1", 0, &srv));
+  for (int i = 0; i < 2; i++) {
+    pthread_t thread;
+    e[i].port = listenPort(&srv);
+    CHECK(0 == pthread_create(&thread, NULL, echoMain, &e[i]));
+    CHECK(-9 == SXAccpet(&srv));
+    pthread_join(thread, NULL);
+  }
+  SXClose(srv.socket);
+  // a new nonce for every connection: a recorded session cannot be replayed
+  CHECK(0 != memcmp(e[0].hello + 8, e[1].hello + 8, 32));
+}
+
+// --- somebody in the path: a relay between the client and the server that
+// changes the first record of the client, or sends it a second time
+
+enum { relayChange, relayRepeat };
+
+struct relay {
+  int listener, mode;
+  uint16_t serverPort;
+};
+
+static void *relayMain(void *arg) {
+  struct relay *r = arg;
+  static uint8_t sent[4096]; // what the client sent after the handshake
+  size_t total = 0;
+  int client = accept(r->listener, NULL, NULL);
+  int server = tcpConnect(r->serverPort);
+  struct pollfd fds[2] = {{.fd = client, .events = POLLIN},
+                          {.fd = server, .events = POLLIN}};
+  while (poll(fds, 2, 5000) > 0) {
+    uint8_t buf[4096];
+    if (fds[1].revents) {
+      ssize_t n = recv(server, buf, sizeof(buf), 0);
+      if (n <= 0)
+        break;
+      send(client, buf, (size_t)n, 0);
+    }
+    if (fds[0].revents) {
+      ssize_t n = recv(client, buf, sizeof(buf), 0);
+      if (n <= 0) { // the client is done
+        if (relayRepeat == r->mode) // length, data and type, tag
+          send(server, sent, 4 + (sent[0] | (size_t)sent[1] << 8) + CONFIRM,
+               0);
+        break;
+      }
+      for (ssize_t i = 0; i < n; i++, total++) {
+        size_t pos = total - (HELLO + CONFIRM);
+        if (total >= HELLO + CONFIRM && pos < sizeof(sent))
+          sent[pos] = buf[i];
+        if (relayChange == r->mode && 4 == pos) // the first byte of the data
+          buf[i] ^= 1;
+      }
+      send(server, buf, (size_t)n, 0);
+    }
+  }
+  if (relayRepeat == r->mode)
+    usleep(300000); // the server reads the repeated record before the EOF
+  close(client);
+  close(server);
+  return NULL;
+}
+
+static int oneMsgClient(struct SXConnection *conn, int sock) {
+  return SXWriteMsg(conn, sock, tOne, "hello", 5);
+}
+
+static void testRelay(int mode) {
+  struct SXConnection srv = mkConn(srvTypes, KEY128);
+  struct client cl = {.conn = mkConn(cliTypes, KEY128), .fn = oneMsgClient};
+  memset(&srvSeen, 0, sizeof(srvSeen));
+  CHECK(0 == SXListen("127.0.0.1", 0, &srv));
+
+  struct relay r = {.mode = mode, .serverPort = listenPort(&srv)};
+  struct sockaddr_in addr = {.sin_family = AF_INET,
+                             .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  socklen_t len = sizeof(addr);
+  r.listener = socket(AF_INET, SOCK_STREAM, 0);
+  CHECK(0 == bind(r.listener, (struct sockaddr *)&addr, sizeof(addr)));
+  CHECK(0 == listen(r.listener, 1));
+  CHECK(0 == getsockname(r.listener, (struct sockaddr *)&addr, &len));
+  cl.port = ntohs(addr.sin_port);
+
+  pthread_t relayThread;
+  CHECK(0 == pthread_create(&relayThread, NULL, relayMain, &r));
+  CHECK(0 == pthread_create(&cl.thread, NULL, clientMain, &cl));
+  int sock = SXAccpet(&srv);
+  CHECK(sock >= 0);
+  if (sock >= 0) {
+    if (relayRepeat == mode) // the record itself is good, once
+      CHECK(0 == SXProcessMsg(&srv, sock));
+    CHECK(-3 == SXProcessMsg(&srv, sock));
+    CHECK(srvSeen.count == (relayRepeat == mode ? 1 : 0));
+  }
+  finish(&srv, &cl, sock);
+  pthread_join(relayThread, NULL);
+  close(r.listener);
+  CHECK(0 == cl.connectRc);
+  CHECK(0 == cl.rc);
 }
 
 // --- an invalid key is refused before any I/O
@@ -322,14 +453,47 @@ static void testNoPlaintextFallback(void) {
   close(sv[1]);
 }
 
+// --- the format follows the socket: a connection made with a key stays
+// encrypted when AESKey is cleared afterwards
+
+static int clearedKeyClient(struct SXConnection *conn, int sock) {
+  conn->AESKey = NULL;
+  int rc = SXWriteMsg(conn, sock, tOne, "hello", 5);
+  return 0 != rc ? rc : SXProcessMsg(conn, sock); // the reply of the server
+}
+
+static void testKeyClearedAfterConnect(void) {
+  struct SXConnection srv = mkConn(srvTypes, KEY128);
+  struct client cl = {.conn = mkConn(cliTypes, KEY128),
+                      .fn = clearedKeyClient};
+  memset(&srvSeen, 0, sizeof(srvSeen));
+  memset(&cliSeen, 0, sizeof(cliSeen));
+
+  int sock = start(&srv, &cl);
+  CHECK(sock >= 0);
+  if (sock >= 0) {
+    CHECK(0 == SXProcessMsg(&srv, sock)); // the server still has the key
+    CHECK(0 == SXWriteMsg(&srv, sock, tOne, "reply", 5));
+  }
+  finish(&srv, &cl, sock);
+
+  CHECK(0 == cl.rc);
+  CHECK(1 == srvSeen.count && 0 == memcmp(srvSeen.data, "hello", 5));
+  CHECK(1 == cliSeen.count && 0 == memcmp(cliSeen.data, "reply", 5));
+}
+
 static void testEncryption(void) {
   testRoundTrip(KEY128);
   testRoundTrip(KEY192);
   testRoundTrip(KEY256);
   testDuplex(KEY128);
   testWrongKey();
+  testHelloEcho();
+  testRelay(relayChange);
+  testRelay(relayRepeat);
   testBadKey();
   testNoPlaintextFallback();
+  testKeyClearedAfterConnect();
 }
 
 #else
@@ -356,10 +520,15 @@ static void testWriteLimits(void) {
 
   CHECK(-1 == SXWriteMsg(&conn, -1, 200, buf, 1));           // undefined type
   CHECK(-2 == SXWriteMsg(&conn, -1, tFixed, buf, FIXED - 1)); // not FixedSize
+  CHECK(-2 == SXWriteMsg(&conn, -1, tFixed, buf, FIXED + 1));
+  CHECK(-2 == SXWriteMsg(&conn, -1, tEmpty, buf, 1)); // data for a type without
   CHECK(-3 == SXWriteMsg(&conn, -1, tOne, buf, 256));
   CHECK(-3 == SXWriteMsg(&conn, -1, tTwo, buf, 0x10000));
   CHECK(-3 == SXWriteMsg(&conn, -1, tThree, buf, MAXSIZE + 1));
   CHECK(-4 == SXWriteMsg(&conn, -1, tBad, buf, 1));
+
+  conn.MaxSize = 0; // only messages without data, as in the Go version
+  CHECK(-3 == SXWriteMsg(&conn, -1, tOne, buf, 1));
 }
 
 // --- writing to a connection closed by the peer is an error, not SIGPIPE

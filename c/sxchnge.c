@@ -23,23 +23,37 @@
 #ifdef SX_ENCRYPTION
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 #endif
 
 #define LISTEN_BACKLOG 1024
-#define headerHello                                                            \
-  { 's', 'x', 'c', 'h', 'n', 'g', 1, 1 }
 
-#define initialPacketSize 1292
-struct initialPacket {
-  char Header[8];
-  uint32_t MaxSize;
-  int8_t SizeBytes[256];
-  uint32_t FixedSizes[256];
-};
-// the struct goes over the wire as it is, the Go version has the same layout
-_Static_assert(sizeof(struct initialPacket) == initialPacketSize,
-               "the compiler pads struct initialPacket");
+// The wire format is described in PROTOCOL.md. Offsets in the hello packet:
+#define HELLO_SIZE 1324
+#define HELLO_NONCE 8 // 32 random bytes with a key, zero without
+#define HELLO_MAXSIZE 40
+#define HELLO_SIZEBYTES 44
+#define HELLO_FIXEDSIZE 300
+
+#define NONCE_SIZE 32
+#define UNDEFINED_TYPE 0x80 // SizeBytes of a slot without a type: -128
+#define TAG_SIZE 16         // AES-GCM tag
+
+// Limit for the handshake when ReadTimeout or WriteTimeout is zero: a silent
+// peer must not hold SXAccpet forever.
+#define HANDSHAKE_TIMEOUT_MS 10000
+
+// Integers go over the wire in little-endian order.
+static void put32(uint8_t *p, uint32_t v) {
+  for (int i = 0; i < 4; i++)
+    p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static uint32_t get32(const uint8_t *p) {
+  return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
+         (uint32_t)p[3] << 24;
+}
 
 // Writing to a socket the peer has closed must return an error, not kill the
 // process with SIGPIPE: Linux takes a send() flag, macOS a socket option.
@@ -116,6 +130,12 @@ static int64_t deadlineAfter(const struct timeval *tv) {
   return ms > 0 ? nowMs() + ms : -1;
 }
 
+// The same for the handshake, where a zero tv is HANDSHAKE_TIMEOUT_MS.
+static int64_t handshakeDeadline(const struct timeval *tv) {
+  int64_t deadline = deadlineAfter(tv);
+  return deadline >= 0 ? deadline : nowMs() + HANDSHAKE_TIMEOUT_MS;
+}
+
 // Waits until sock is readable (POLLIN) or writable (POLLOUT). Returns -1
 // when the deadline has passed or poll failed; a signal is neither.
 static int waitReady(int sock, short events, int64_t deadline) {
@@ -178,23 +198,32 @@ static int encEnabled(struct SXConnection *conn) {
 
 #ifdef SX_ENCRYPTION
 
-// AES-CTR state of one socket, one context per direction. One SXConnection
-// serves every socket returned by SXAccpet, so the state is keyed by fd.
+// AES-GCM state of one socket: a context with the key of each direction and
+// the number of its next record, which is the nonce. One SXConnection serves
+// every socket returned by SXAccpet, so the state is keyed by fd.
 // ponytail: fixed table, an encrypted socket needs fd < SX_MAX_ENC_FD; replace
 // with a growable map if a process holds more descriptors than that.
 #define SX_MAX_ENC_FD 65536
 static struct {
   EVP_CIPHER_CTX *r, *w;
+  uint64_t rseq, wseq;
 } ciphers[SX_MAX_ENC_FD];
 
 static int encFd(int sock) { return sock >= 0 && sock < SX_MAX_ENC_FD; }
+
+// Whether sock carries records. The handshake decides, not AESKey at the time
+// of the call: a connection made with a key never falls back to frames in the
+// clear. A key without cipher state counts too, and fails in encRecord.
+static int encActive(struct SXConnection *conn, int sock) {
+  return encEnabled(conn) || (encFd(sock) && NULL != ciphers[sock].w);
+}
 
 static void encReset(int sock) {
   if (!encFd(sock))
     return;
   EVP_CIPHER_CTX_free(ciphers[sock].r);
   EVP_CIPHER_CTX_free(ciphers[sock].w);
-  ciphers[sock].r = ciphers[sock].w = NULL;
+  memset(&ciphers[sock], 0, sizeof(ciphers[sock]));
 }
 
 // Decodes a hex AES key, returns its length in bytes or -1.
@@ -221,152 +250,189 @@ static int encCheckKey(struct SXConnection *conn) {
   return ok ? 0 : -8;
 }
 
-static EVP_CIPHER_CTX *newCTR(const EVP_CIPHER *cipher, const uint8_t *key,
-                              const uint8_t *iv) {
-  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  if (NULL != ctx && EVP_EncryptInit_ex(ctx, cipher, NULL, key, iv) != 1) {
-    EVP_CIPHER_CTX_free(ctx);
-    ctx = NULL;
+static int encRandom(uint8_t *buf, int len) {
+  return RAND_bytes(buf, len) == 1 ? 0 : -1;
+}
+
+// The cipher of one direction. Its AES-256-GCM key is the HMAC-SHA256 of the
+// label and the hello packets of both sides under the shared key.
+#define LABEL_SIZE 15
+static EVP_CIPHER_CTX *newDirection(const uint8_t *psk, int pskLen,
+                                    const char *label,
+                                    const uint8_t *helloClient,
+                                    const uint8_t *helloServer, int encrypt) {
+  uint8_t msg[LABEL_SIZE + 2 * HELLO_SIZE], key[EVP_MAX_MD_SIZE];
+  memcpy(msg, label, LABEL_SIZE);
+  memcpy(msg + LABEL_SIZE, helloClient, HELLO_SIZE);
+  memcpy(msg + LABEL_SIZE + HELLO_SIZE, helloServer, HELLO_SIZE);
+
+  EVP_CIPHER_CTX *ctx = NULL;
+  if (NULL != HMAC(EVP_sha256(), psk, pskLen, msg, sizeof(msg), key, NULL)) {
+    ctx = EVP_CIPHER_CTX_new();
+    if (NULL != ctx && EVP_CipherInit_ex(ctx, EVP_aes_256_gcm(), NULL, key,
+                                         NULL, encrypt) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      ctx = NULL;
+    }
   }
+  OPENSSL_cleanse(key, sizeof(key));
   return ctx;
 }
 
-// Same exchange as encSetup in go/common.go: each side sends a random IV in
-// the clear and encrypts its outgoing stream with it.
-static int encSetup(int sock, struct SXConnection *conn) {
+// One AES-GCM record, in place, with the next nonce of its direction. With
+// write it encrypts buf and stores the tag; without, it decrypts buf and
+// returns -1 unless the tag fits. aad is authenticated only.
+static int encRecord(int sock, int write, const uint8_t *aad, int aadLen,
+                     uint8_t *buf, size_t len, uint8_t *tag) {
+  if (!encFd(sock))
+    return -1;
+  EVP_CIPHER_CTX *ctx = write ? ciphers[sock].w : ciphers[sock].r;
+  uint64_t *seq = write ? &ciphers[sock].wseq : &ciphers[sock].rseq;
+  if (NULL == ctx)
+    return -1; // closed with SXClose, or not from SXConnect/SXAccpet
+
+  uint8_t nonce[12] = {0}, none[16];
+  for (int i = 0; i < 8; i++)
+    nonce[i] = (uint8_t)(*seq >> (8 * i));
+  (*seq)++;
+
+  int out;
+  if (EVP_CipherInit_ex(ctx, NULL, NULL, NULL, nonce, -1) != 1)
+    return -1;
+  if (!write &&
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_SIZE, tag) != 1)
+    return -1;
+  if (aadLen > 0 && EVP_CipherUpdate(ctx, NULL, &out, aad, aadLen) != 1)
+    return -1;
+  for (size_t done = 0; done < len;) { // the length argument is an int
+    int chunk = len - done > (1 << 30) ? (1 << 30) : (int)(len - done);
+    if (EVP_CipherUpdate(ctx, buf + done, &out, buf + done, chunk) != 1)
+      return -1;
+    done += (size_t)chunk;
+  }
+  if (EVP_CipherFinal_ex(ctx, none, &out) != 1)
+    return -1; // on read: the tag does not fit
+  if (write &&
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_SIZE, tag) != 1)
+    return -1;
+  return 0;
+}
+
+// Derives the keys of both directions and exchanges the key confirmation:
+// record 0 of each direction, without data. The keys depend on both hello
+// packets, so it also proves that nobody changed them on the way.
+// -2: the confirmation of the peer does not verify.
+static int encSetup(int sock, struct SXConnection *conn,
+                    const uint8_t *helloClient, const uint8_t *helloServer,
+                    int server) {
   encReset(sock); // the fd may have carried an encrypted connection before
   if (!encEnabled(conn))
     return 0;
   if (!encFd(sock))
     return -1;
 
-  uint8_t key[32];
-  const EVP_CIPHER *cipher;
-  switch (parseKey(conn->AESKey, key)) {
-  case 16:
-    cipher = EVP_aes_128_ctr();
-    break;
-  case 24:
-    cipher = EVP_aes_192_ctr();
-    break;
-  case 32:
-    cipher = EVP_aes_256_ctr();
-    break;
-  default:
+  uint8_t psk[32];
+  int pskLen = parseKey(conn->AESKey, psk);
+  if (pskLen < 0)
     return -1;
-  }
+  EVP_CIPHER_CTX *toServer = newDirection(
+      psk, pskLen, "sxchnge2 client", helloClient, helloServer, !server);
+  EVP_CIPHER_CTX *toClient = newDirection(
+      psk, pskLen, "sxchnge2 server", helloClient, helloServer, server);
+  OPENSSL_cleanse(psk, sizeof(psk));
+  ciphers[sock].w = server ? toClient : toServer;
+  ciphers[sock].r = server ? toServer : toClient;
 
-  uint8_t iv[16], peerIV[16];
+  uint8_t tag[TAG_SIZE], peerTag[TAG_SIZE];
   int result = -1;
-  if (RAND_bytes(iv, sizeof(iv)) == 1 &&
-      loopWrite(sock, iv, sizeof(iv), deadlineAfter(&conn->WriteTimeout)) ==
-          0 &&
-      recvAll(sock, peerIV, sizeof(peerIV),
-              deadlineAfter(&conn->ReadTimeout)) == 0) {
-    ciphers[sock].w = newCTR(cipher, key, iv);
-    ciphers[sock].r = newCTR(cipher, key, peerIV);
-    if (NULL != ciphers[sock].w && NULL != ciphers[sock].r)
-      result = 0;
-    else
-      encReset(sock);
-  }
-  OPENSSL_cleanse(key, sizeof(key));
+  if (NULL != toServer && NULL != toClient &&
+      encRecord(sock, 1, NULL, 0, NULL, 0, tag) == 0 &&
+      loopWrite(sock, tag, sizeof(tag),
+                handshakeDeadline(&conn->WriteTimeout)) == 0 &&
+      recvAll(sock, peerTag, sizeof(peerTag),
+              handshakeDeadline(&conn->ReadTimeout)) == 0)
+    result = encRecord(sock, 0, NULL, 0, NULL, 0, peerTag) == 0 ? 0 : -2;
+  if (result < 0)
+    encReset(sock);
   return result;
-}
-
-// XORs buf in place with the keystream of one direction of the socket; does
-// nothing for a plain socket. CTR decryption is the same XOR as encryption.
-// A key without cipher state (the socket was closed with SXClose, or did not
-// come from SXConnect/SXAccpet) is an error: the data must not pass in the
-// clear.
-static int encCrypt(struct SXConnection *conn, int sock, int write,
-                    uint8_t *buf, size_t len) {
-  EVP_CIPHER_CTX *ctx = NULL;
-  if (encFd(sock))
-    ctx = write ? ciphers[sock].w : ciphers[sock].r;
-  int out;
-  if (NULL == ctx)
-    return encEnabled(conn) ? -1 : 0;
-  if (len > INT_MAX || EVP_EncryptUpdate(ctx, buf, &out, buf, (int)len) != 1)
-    return -1;
-  return 0;
 }
 
 #else // no SX_ENCRYPTION
 
 static void encReset(int sock) { (void)sock; }
 
+static int encActive(struct SXConnection *conn, int sock) {
+  (void)sock;
+  return encEnabled(conn); // fails in encRecord
+}
+
 static int encCheckKey(struct SXConnection *conn) {
   return encEnabled(conn) ? -7 : 0;
 }
 
-static int encSetup(int sock, struct SXConnection *conn) {
-  (void)sock;
-  return encEnabled(conn) ? -1 : 0;
+static int encRandom(uint8_t *buf, int len) {
+  (void)buf, (void)len;
+  return -1;
 }
 
-static int encCrypt(struct SXConnection *conn, int sock, int write,
-                    uint8_t *buf, size_t len) {
-  (void)conn, (void)sock, (void)write, (void)buf, (void)len;
-  return 0;
+static int encRecord(int sock, int write, const uint8_t *aad, int aadLen,
+                     uint8_t *buf, size_t len, uint8_t *tag) {
+  (void)sock, (void)write, (void)aad, (void)aadLen, (void)buf, (void)len;
+  (void)tag;
+  return -1;
+}
+
+static int encSetup(int sock, struct SXConnection *conn,
+                    const uint8_t *helloClient, const uint8_t *helloServer,
+                    int server) {
+  (void)sock, (void)helloClient, (void)helloServer, (void)server;
+  return encEnabled(conn) ? -1 : 0;
 }
 
 #endif
 
-// Encrypts buf in place when the socket has a cipher, then sends it.
-static int sxWrite(struct SXConnection *conn, int sock, uint8_t *buf,
-                   size_t len) {
-  if (encCrypt(conn, sock, 1, buf, len) < 0)
-    return -5;
-  return loopWrite(sock, buf, len, deadlineAfter(&conn->WriteTimeout));
-}
-
-static int sxRead(struct SXConnection *conn, int sock, uint8_t *buf,
-                  size_t len) {
-  if (recvAll(sock, buf, len, deadlineAfter(&conn->ReadTimeout)) < 0)
-    return -1;
-  return encCrypt(conn, sock, 0, buf, len);
-}
-
-static void prepareInitialPacket(struct initialPacket *ip,
-                                 struct SXConnection *conn) {
-  static const char header[8] = headerHello;
-  for (int i = 0; i < 8; i++)
-    ip->Header[i] = header[i];
-  if (encEnabled(conn))
-    ip->Header[4] = 'E';
-  ip->MaxSize = conn->MaxSize;
+static int prepareHello(uint8_t *hello, struct SXConnection *conn) {
+  static const uint8_t header[8] = {'s', 'x', 'c', 'h', 'n', 'g', 2, 0};
+  memset(hello, 0, HELLO_SIZE);
+  memcpy(hello, header, sizeof(header));
+  if (encEnabled(conn)) {
+    hello[4] = 'E';
+    if (encRandom(hello + HELLO_NONCE, NONCE_SIZE) < 0)
+      return -1;
+  }
+  put32(hello + HELLO_MAXSIZE, conn->MaxSize);
   for (int i = 0; i < 256; i++) {
     struct SXDataType *dt = conn->SXDataType[i];
-    if (NULL != dt) {
-      ip->FixedSizes[i] = dt->FixedSize;
-      ip->SizeBytes[i] = dt->SizeBytes;
-    } else {
-      ip->FixedSizes[i] = 0;
-      ip->SizeBytes[i] = 0;
-    }
+    hello[HELLO_SIZEBYTES + i] =
+        NULL != dt ? (uint8_t)dt->SizeBytes : UNDEFINED_TYPE;
+    put32(hello + HELLO_FIXEDSIZE + 4 * i, NULL != dt ? dt->FixedSize : 0);
   }
-}
-
-static int connectionInit(int sock, struct SXConnection *conn) {
-  // objects of the struct type, not char buffers cast to it: no alignment or
-  // aliasing questions
-  struct initialPacket hello, peer;
-  prepareInitialPacket(&hello, conn);
-  if (loopWrite(sock, (const uint8_t *)&hello, sizeof(hello),
-                deadlineAfter(&conn->WriteTimeout)) < 0)
-    return -1;
-  if (recvAll(sock, &peer, sizeof(peer), deadlineAfter(&conn->ReadTimeout)) <
-      0)
-    return -2;
-  if (0 != memcmp(&hello, &peer, sizeof(hello)))
-    return -3;
-  if (encSetup(sock, conn) < 0)
-    return -4;
   return 0;
 }
 
-// The packet layout is checked by the _Static_assert above.
+// The handshake. server tells which side we are: the two directions have
+// different keys. -5: the key confirmation failed.
+static int connectionInit(int sock, struct SXConnection *conn, int server) {
+  uint8_t hello[HELLO_SIZE], peer[HELLO_SIZE];
+  if (prepareHello(hello, conn) < 0)
+    return -1;
+  if (loopWrite(sock, hello, sizeof(hello),
+                handshakeDeadline(&conn->WriteTimeout)) < 0)
+    return -1;
+  if (recvAll(sock, peer, sizeof(peer),
+              handshakeDeadline(&conn->ReadTimeout)) < 0)
+    return -2;
+  // everything but the nonce has to be equal
+  if (0 != memcmp(hello, peer, HELLO_NONCE) ||
+      0 != memcmp(hello + HELLO_MAXSIZE, peer + HELLO_MAXSIZE,
+                  HELLO_SIZE - HELLO_MAXSIZE))
+    return -3;
+  int rc = encSetup(sock, conn, server ? peer : hello, server ? hello : peer,
+                    server);
+  return 0 == rc ? 0 : -2 == rc ? -5 : -4;
+}
+
+// Nothing to check: the hello is built byte by byte.
 int SXInit(void) { return 0; }
 
 // Resolves ip:port for TCP, NULL if it fails; free with freeaddrinfo.
@@ -454,9 +520,10 @@ int SXConnect(const char *ip, uint16_t port, struct SXConnection *conn) {
     return -5;
   }
 
-  if (connectionInit(sock, conn) < 0) {
+  int rc = connectionInit(sock, conn, 0);
+  if (rc < 0) {
     close(sock);
-    return -6;
+    return -5 == rc ? -9 : -6;
   }
 
   conn->socket = sock;
@@ -525,9 +592,10 @@ int SXAccpet(struct SXConnection *conn) {
     return -5;
   }
 
-  if (connectionInit(sock, conn) < 0) {
+  int rc = connectionInit(sock, conn, 1);
+  if (rc < 0) {
     close(sock);
-    return -6;
+    return -5 == rc ? -9 : -6;
   }
 
   return sock;
@@ -536,6 +604,25 @@ int SXAccpet(struct SXConnection *conn) {
 int SXClose(int sock) {
   encReset(sock);
   return close(sock);
+}
+
+// 0, or the SXWriteMsg code for a message of len bytes that does not fit the
+// type.
+static int checkSize(const struct SXDataType *dt, uint32_t len) {
+  switch (dt->SizeBytes) {
+  case -1:
+    return dt->FixedSize == len ? 0 : -2;
+  case 0:
+    return 0 == len ? 0 : -2;
+  case 1:
+  case 2:
+  case 3:
+    return 0 == len >> (8 * dt->SizeBytes) ? 0 : -3;
+  case 4: // MaxSize is the limit
+    return 0;
+  default:
+    return -4;
+  }
 }
 
 int SXWriteMsg(struct SXConnection *conn, int sock, uint8_t msgType,
@@ -547,145 +634,169 @@ int SXWriteMsg(struct SXConnection *conn, int sock, uint8_t msgType,
     return -1;
   }
 
-  uint8_t header[5];
-  header[0] = msgType;
-  uint8_t headerLen = 1;
-
-  switch (dt->SizeBytes) {
-  case -1:
-    if (dt->FixedSize != msgLen) {
-      return -2;
-    }
-    break;
-  case 0:
-    msgLen = 0;
-    break;
-  case 1:
-    if (msgLen > 255) {
-      return -3;
-    }
-
-    header[1] = (uint8_t)msgLen;
-    headerLen = 2;
-    break;
-  case 2:
-    if (msgLen > 0xffff) {
-      return -3;
-    }
-    header[1] = (uint8_t)(msgLen & 0xff);
-    header[2] = (uint8_t)((msgLen & 0xff00) >> 8);
-    headerLen = 3;
-    break;
-  case 3:
-    if (msgLen > 0xffffff) {
-      return -3;
-    }
-    header[1] = (uint8_t)(msgLen & 0xff);
-    header[2] = (uint8_t)((msgLen & 0xff00) >> 8);
-    header[3] = (uint8_t)((msgLen & 0xff0000) >> 16);
-    headerLen = 4;
-    break;
-  default:
-    return -4;
+  int rc = checkSize(dt, msgLen);
+  if (rc < 0) {
+    return rc;
   }
 
-  // the peer has the same MaxSize and would drop the connection
-  if ((conn->MaxSize > 0) && (msgLen > conn->MaxSize)) {
+  // the peer has the same MaxSize and would drop the connection; a record
+  // counts the type byte into its 4-byte length
+  if (msgLen > conn->MaxSize || UINT32_MAX == msgLen) {
     return -3;
   }
 
-  // One buffer and one send per frame: with TCP_NODELAY header, body and crc
-  // sent separately are three TCP segments.
-  size_t frameLen = headerLen + (size_t)msgLen + (msgLen > 0 ? 4 : 0);
-  uint8_t *frame = malloc(frameLen);
+  // One buffer and one send per frame: with TCP_NODELAY the parts sent
+  // separately are separate TCP segments. 4 + 1 + TAG_SIZE is the longer of
+  // the two kinds of frame.
+  uint8_t *frame = malloc((size_t)msgLen + 4 + 1 + TAG_SIZE);
   if (NULL == frame) {
     return -10;
   }
-  memcpy(frame, header, headerLen);
-  if (msgLen > 0) {
-    uint32_t crc = sxCrc32(msg, msgLen);
-    memcpy(frame + headerLen, msg, msgLen);
-    memcpy(frame + headerLen + msgLen, &crc, sizeof(crc));
+
+  size_t len = 0;
+  if (encActive(conn, sock)) {
+    // length, then data and type encrypted in place, then the tag
+    put32(frame, msgLen + 1);
+    if (msgLen > 0) {
+      memcpy(frame + 4, msg, msgLen);
+    }
+    frame[4 + (size_t)msgLen] = msgType;
+    len = 4 + (size_t)msgLen + 1;
+    if (encRecord(sock, 1, frame, 4, frame + 4, len - 4, frame + len) < 0) {
+      free(frame);
+      return -5;
+    }
+    len += TAG_SIZE;
+  } else {
+    // type, size, data, crc
+    frame[len++] = msgType;
+    for (int i = 0; i < dt->SizeBytes; i++) {
+      frame[len++] = (uint8_t)(msgLen >> (8 * i));
+    }
+    if (msgLen > 0) {
+      memcpy(frame + len, msg, msgLen);
+      put32(frame + len + msgLen, sxCrc32(msg, msgLen));
+      len += (size_t)msgLen + 4;
+    }
   }
 
-  int result = sxWrite(conn, sock, frame, frameLen);
+  int result = loopWrite(sock, frame, len, deadlineAfter(&conn->WriteTimeout));
   free(frame);
   return result;
 }
 
-int SXProcessMsg(struct SXConnection *conn, int sock) {
+// Reads size bytes and extra more into a new buffer; the caller frees *buf.
+static int readBody(struct SXConnection *conn, int sock, uint32_t size,
+                    uint32_t extra, uint8_t **buf) {
+  uint64_t total = (uint64_t)size + extra;
+  if (total != (size_t)total) { // a 32-bit size_t
+    return -10;
+  }
+  *buf = malloc((size_t)total);
+  if (NULL == *buf) {
+    return -10;
+  }
+  return recvAll(sock, *buf, (size_t)total,
+                 deadlineAfter(&conn->ReadTimeout)) < 0
+             ? -2
+             : 0;
+}
 
-  uint8_t msgType = 0;
-
-  if (sxRead(conn, sock, &msgType, 1) < 0) {
+// One message of a connection without a key: type, size, data, crc.
+// *buf is allocated here and freed by the caller, also after an error.
+static int readFrame(struct SXConnection *conn, int sock,
+                     struct SXDataType **dtOut, uint8_t **buf,
+                     uint32_t *sizeOut) {
+  uint8_t hdr[5];
+  if (recvAll(sock, hdr, 1, deadlineAfter(&conn->ReadTimeout)) < 0) {
     return -2;
   }
 
-  struct SXDataType *dt = conn->SXDataType[msgType];
-
-  // SizeBytes is local config, but a value above 3 would let the peer write
-  // past sizebuf; 4 is valid in the Go version and not implemented here.
-  if (NULL == dt || dt->SizeBytes < -1 || dt->SizeBytes > 3) {
+  // SizeBytes is local config, but a value above 4 would let the peer write
+  // past hdr.
+  struct SXDataType *dt = conn->SXDataType[hdr[0]];
+  if (NULL == dt || dt->SizeBytes < -1 || dt->SizeBytes > 4) {
     return -1;
   }
 
-  uint8_t sizebuf[4];
+  uint32_t size = -1 == dt->SizeBytes ? dt->FixedSize : 0;
   if (dt->SizeBytes > 0) {
-    if (sxRead(conn, sock, sizebuf, (size_t)dt->SizeBytes) < 0) {
+    if (recvAll(sock, hdr + 1, (size_t)dt->SizeBytes,
+                deadlineAfter(&conn->ReadTimeout)) < 0) {
       return -2;
+    }
+    for (int i = 0; i < dt->SizeBytes; i++) {
+      size |= (uint32_t)hdr[1 + i] << (8 * i);
     }
   }
 
-  uint32_t size2read = 0;
-
-  switch (dt->SizeBytes) {
-  case -1:
-    size2read = dt->FixedSize;
-    break;
-  //  case 0: // we just have 0 in size2read
-  case 1:
-    size2read = (uint32_t)sizebuf[0];
-    break;
-  case 2:
-    size2read = (uint32_t)sizebuf[0] | (((uint32_t)sizebuf[1]) << 8);
-    break;
-  case 3:
-    size2read = (uint32_t)sizebuf[0] | (((uint32_t)sizebuf[1]) << 8) |
-                (((uint32_t)sizebuf[2]) << 16);
-    break;
-  }
-
-  // MaxSize bounds what an unauthenticated peer can make us allocate per message.
-  if ((conn->MaxSize > 0) && (size2read > conn->MaxSize)) {
+  // MaxSize bounds what a peer can make us allocate per message.
+  if (size > conn->MaxSize) {
     return -4;
   }
 
-  uint8_t *buf = NULL;
-  if (size2read > 0) {
-    size_t total = (size_t)size2read + 4; // payload + crc, no uint32 wrap
-    buf = malloc(total);
-    if (NULL == buf) {
-      return -10;
-    }
-    if (sxRead(conn, sock, buf, total) < 0) {
-      free(buf);
-      return -2;
-    }
-    uint32_t crc; // the crc is not aligned inside buf
-    memcpy(&crc, buf + size2read, sizeof(crc));
-    if (crc != sxCrc32(buf, size2read)) {
-      free(buf);
-      return -3;
-    }
+  *dtOut = dt;
+  *sizeOut = size;
+  if (0 == size) {
+    return 0;
   }
 
-  if (dt->Callback) {
-    dt->Callback(buf, size2read, sock, conn);
+  int rc = readBody(conn, sock, size, 4, buf); // data and crc
+  if (rc < 0) {
+    return rc;
+  }
+  return get32(*buf + size) == sxCrc32(*buf, size) ? 0 : -3;
+}
+
+// One message of a connection with a key: the length, then data and type
+// encrypted, then the tag. *buf as in readFrame.
+static int readRecord(struct SXConnection *conn, int sock,
+                      struct SXDataType **dtOut, uint8_t **buf,
+                      uint32_t *sizeOut) {
+  uint8_t lenBuf[4];
+  if (recvAll(sock, lenBuf, sizeof(lenBuf),
+              deadlineAfter(&conn->ReadTimeout)) < 0) {
+    return -2;
   }
 
-  if (buf) {
-    free(buf);
+  // Checked before the tag can be: MaxSize bounds what anybody in the path
+  // can make us allocate.
+  uint32_t len = get32(lenBuf); // data and type
+  if (0 == len || len - 1 > conn->MaxSize) {
+    return -4;
   }
 
+  int rc = readBody(conn, sock, len, TAG_SIZE, buf);
+  if (rc < 0) {
+    return rc;
+  }
+  if (encRecord(sock, 0, lenBuf, sizeof(lenBuf), *buf, len, *buf + len) < 0) {
+    return -3;
+  }
+
+  struct SXDataType *dt = conn->SXDataType[(*buf)[len - 1]];
+  if (NULL == dt) {
+    return -1;
+  }
+  if (checkSize(dt, len - 1) < 0) {
+    return -4;
+  }
+  *dtOut = dt;
+  *sizeOut = len - 1;
   return 0;
+}
+
+int SXProcessMsg(struct SXConnection *conn, int sock) {
+  struct SXDataType *dt = NULL;
+  uint8_t *buf = NULL;
+  uint32_t size = 0;
+
+  int rc = encActive(conn, sock) ? readRecord(conn, sock, &dt, &buf, &size)
+                                 : readFrame(conn, sock, &dt, &buf, &size);
+  if (0 == rc && dt->Callback) {
+    dt->Callback(size > 0 ? buf : NULL, size, sock, conn);
+  }
+
+  free(buf);
+  return rc;
 }

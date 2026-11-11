@@ -1,22 +1,37 @@
 # sxchnge
 Easy exchange struct and plain data via TCP between golang and C
 
-Protocol providing handshake on connect, AES-CTR encryption, comparing version and list of datatypes, sizes etc
+This branch speaks protocol 2.0, described in [PROTOCOL.md](PROTOCOL.md). It does not talk to protocol 1.1 (branch `master`, tags v1.x): update both ends of a connection together.
 
-Encryption is enabled by setting `AESKey` (AES-128/192/256 key in hex) to the same value on both sides.
+The handshake on connect compares the protocol version, `MaxSize` and the list of datatypes. With a key it also proves that both sides have the same key, and every message is encrypted and authenticated with AES-256-GCM.
+
+## Key
+
+Set `AESKey` to the same value on both sides: 16, 24 or 32 random bytes in hex, for example from `openssl rand -hex 32`. Not a password: a recorded handshake lets somebody test guesses offline.
+
+With a key, somebody in the network path who does not have it cannot connect, read a message or replay a recorded session. A message that was changed, added, repeated, reordered or dropped from the middle of a session makes the receiver close the connection. A wrong key fails in `Connect`, `ListenOne` (through `onError`), `SXConnect` and `SXAccpet`.
+
+Not covered:
+
+- The length of every message is visible, and the type table goes in the clear.
+- There is no forward secrecy: somebody who gets the key later reads the sessions recorded before.
+- A peer that has the key is trusted completely, and the handshake does not tell one holder of the key from another. Somebody in the path can connect a client to another server with the same key and the same types. Use one key for one link.
+- Somebody in the path can close the connection early. The last messages are then lost, and the receiver sees the same as when the sender closes.
+
+Without a key the connection is in the clear with a CRC per message, and anybody who can reach the port can connect.
 
 The C version is built without encryption by default and then has no dependencies. Build it with `make ENCRYPTION=1` (the compiler flag `-DSX_ENCRYPTION`) to get AES support; that build uses OpenSSL libcrypto, link your program with `-lcrypto`.
 
 ## Rules for both versions
 
-- The handshake fails unless both sides have the same `MaxSize`, the same types (`SizeBytes` and `FixedSize` of all 256 slots) and the same encryption setting. One difference passes: a type with `SizeBytes` 0 looks the same as an undefined slot, so a no-data type defined on one side only is found when its first message arrives.
-- `SizeBytes` of a type: `-1` fixed size of `FixedSize` bytes, `0` no data, `1` to `3` a size header of that many bytes. The Go version also accepts `4`, the C version does not.
-- `MaxSize` limits one message in both directions. Zero differs: Go rejects every non-empty message, C applies no limit.
+- The handshake fails unless both sides have the same `MaxSize`, the same types (which of the 256 are defined, their `SizeBytes` and `FixedSize`) and the same encryption setting.
+- `SizeBytes` of a type: `-1` fixed size of `FixedSize` bytes, `0` no data, `1` to `4` a size header of that many bytes. A buffer of another length than `FixedSize`, and a non-empty buffer for a type without data, are errors.
+- `MaxSize` limits the data of one message in both directions. With zero only messages without data pass.
 - A connection that receives nothing for `ReadTimeout` is closed. Send a ping type more often than that to keep it open.
 - `KeepAlive` is the idle time before the first TCP keep-alive probe and the interval between probes. Zero turns keep-alive off.
-- Zero timeouts differ: in Go a zero `ReadTimeout` or `WriteTimeout` fails every read or write, in C zero means no timeout.
+- A zero `ReadTimeout`, `WriteTimeout` or `ConnectTimeout` means no limit. The handshake is the exception: with a zero `ReadTimeout` or `WriteTimeout` its reads and writes get 10 s, so a peer that connects and says nothing does not hold a server forever.
 - After a failed read or write the stream is in the middle of a message. Close the connection and open a new one.
-- The handshake and the CRC use host byte order, so both hosts have to be little-endian.
+- Everything the library puts on the wire is little-endian on every host. The data of a message goes as the program gives it: a struct sent as it is needs the same layout and byte order on both sides.
 
 ## Go
 
@@ -30,7 +45,7 @@ c.Disconnect()
 err := c.Close()
 ```
 
-- The module needs Go 1.23 or newer.
+- The module is `github.com/kanocz/sxchnge/v2`, the package is imported as `github.com/kanocz/sxchnge/v2/go`. It needs Go 1.23 or newer.
 - `WriteMsg` can be called from several goroutines. A failed write closes the connection: part of the frame may be on the wire, so every later `WriteMsg` returns an error until the next connection.
 - Callbacks run one at a time in the read loop. After `Connect` on a connected client the first callback of the new connection waits until a callback of the old one has returned. The slice they get is reused for the next message: copy it to keep it.
 - `Disconnect()` closes the current connection. A blocked read returns at once and no callback runs after it. A `ListenOne` server goes on to accept the next client.
@@ -56,8 +71,9 @@ SXClose(sock);
 - One `struct SXConnection` serves every socket accepted from its listener.
 - Per socket one thread may read while another one writes. Two writers on the same socket need a lock in the calling code.
 - Close the sockets with `SXClose`, not `close`: it also frees the AES state of the socket.
+- A socket connected with a key stays encrypted for its whole life. `AESKey` is read in the handshake; clearing it afterwards does not send anything in the clear.
 - An encrypted socket needs a descriptor below 65536.
-- `ReadTimeout` applies to each read of `SXProcessMsg` (the type byte, the size, the data with its CRC), so the first one is the wait for a new message. `WriteTimeout` covers one whole frame.
+- `ReadTimeout` applies to each read of `SXProcessMsg` (the type byte, the size, the data with its CRC; with a key the length, then the rest of the record), so the first one is the wait for a new message. `WriteTimeout` covers one whole frame.
 - `ConnectTimeout` covers the TCP connects to all the addresses of the host together; each address gets an equal share of the time that is left, so one that does not answer leaves time for the next. Resolving a host name is not included.
 - A signal neither fails a call nor restarts its timeout, with one exception: `SXAccpet` waiting for a client returns `-1` with `errno` `EINTR`. A handler that sets a flag, installed without `SA_RESTART`, is the way to stop an accept loop. `ECONNABORTED` from `SXAccpet` is no reason to stop a server either.
 - The sockets are non-blocking and have close-on-exec set. The library waits in `poll`; a program that calls `send` or `recv` on such a socket itself gets `EAGAIN` instead of waiting.
@@ -73,9 +89,35 @@ Build options:
 
 All four example programs take the AES key as an optional argument, for example `server-example 00112233445566778899AABBCCDDEEFF`.
 
+## Changes from protocol 1.1 that need attention in the calling code
+
+Both versions:
+
+- No connection between protocol 2.0 and 1.1, with or without a key.
+- With a key, a peer with another key is refused in the handshake. Before, the connection was made and the first message failed.
+- With a key, a message costs 21 bytes on top of its data (length, type, tag); it was 1 to 9.
+- A type without data (`SizeBytes` 0) has to be defined on both sides. Before, the handshake passed and the first message of that type ended the connection.
+- Writing a buffer with data to a type without data is an error. Before, the data was dropped and the call succeeded.
+- The wire format is little-endian on every host; it was host byte order.
+
+Go:
+
+- The import path is `github.com/kanocz/sxchnge/v2/go`.
+- A zero `ReadTimeout` or `WriteTimeout` means no limit. Before, every read or write failed at once.
+- `WriteMsg` returns an error for a fixed-size type when the buffer is longer than `FixedSize`. Before, it sent the first `FixedSize` bytes.
+
+C:
+
+- `MaxSize` 0 lets only messages without data pass, as in Go. Before, it meant no limit.
+- `SizeBytes` 4 is supported.
+- `SXConnect` and `SXAccpet` return `-9` when the key confirmation fails: another key on the other side, or a handshake changed on the way.
+- A zero `ReadTimeout` no longer lets a silent client hold `SXAccpet` forever: the handshake gets 10 s.
+- `SXProcessMsg` returns `-3` with a key for a message that is not authentic and for a socket without cipher state, and `-4` also for a size the type does not allow.
+- `SXWriteMsg` returns `-2` for data given to a type without data.
+
 ## Changes after v1.1.3 that need attention in the calling code
 
-The wire format is the same: old and new versions talk to each other.
+These are also in the last v1 code on `master`; they did not change the wire format of protocol 1.1.
 
 Go:
 
@@ -115,7 +157,7 @@ C:
 - A signal during the connect no longer fails `SXConnect`. `SXAccpet` still returns `-1` with `errno` `EINTR` when a signal arrives while it waits for a client.
 - A failed `SXConnect` or `SXListen` sets `conn->socket` to `-1`. Before, the old value stayed there: the descriptor of an earlier connection, or 0 in a zeroed struct.
 - `SXWriteMsg` takes `const void *msg`; the `(char *)` casts in the calling code are no longer needed.
-- `SXInit` always returns 0: the packet layout is checked when the library is compiled.
+- `SXInit` always returns 0.
 - With `AESKey` set, a socket without cipher state (closed with `SXClose`, or not returned by `SXConnect` or `SXAccpet`) gets `-5` from `SXWriteMsg` and `-2` from `SXProcessMsg`. Before, the data passed unencrypted.
 
 ## Tests

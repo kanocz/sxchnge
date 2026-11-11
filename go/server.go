@@ -14,7 +14,7 @@ func (c *Connection) ListenOne(address string, onConnect func(*Connection, <-cha
 		return errNilCallback // the accept goroutine calls both
 	}
 
-	if _, err := c.aesBlock(); nil != err {
+	if _, err := c.psk(); nil != err {
 		return err // an invalid AESKey, not an error on every connection
 	}
 
@@ -50,7 +50,7 @@ func (c *Connection) ListenOne(address string, onConnect func(*Connection, <-cha
 				continue
 			}
 
-			s, err := c.initConnection(conn)
+			s, err := c.initConnection(conn, true)
 
 			// Close that ran before initConnection registered conn could not close it
 			c.connMutex.Lock()

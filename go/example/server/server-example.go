@@ -9,7 +9,7 @@ import (
 	"time"
 	"unsafe"
 
-	sxchange "github.com/kanocz/sxchnge/go"
+	sxchange "github.com/kanocz/sxchnge/v2/go"
 )
 
 const (

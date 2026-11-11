@@ -12,7 +12,7 @@ var (
 // Connect to remote server. A previous connection of this Connection is closed.
 func (c *Connection) Connect(address string) error {
 
-	if _, err := c.aesBlock(); nil != err {
+	if _, err := c.psk(); nil != err {
 		return err // an invalid AESKey, before any network activity
 	}
 
@@ -28,7 +28,7 @@ func (c *Connection) Connect(address string) error {
 		return errNonTCP
 	}
 
-	s, err := c.initConnection(tcpConn)
+	s, err := c.initConnection(tcpConn, false)
 	if nil != err {
 		return err
 	}

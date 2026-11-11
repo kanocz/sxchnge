@@ -12,7 +12,7 @@ typedef void (*SXCB)(void *data, size_t size, int sock,
                      struct SXConnection *conn);
 
 struct SXDataType {
-  int8_t SizeBytes; // -1 fixed size, 0 no data, 1..3 bytes of size header
+  int8_t SizeBytes; // -1 fixed size, 0 no data, 1..4 bytes of size header
   uint32_t FixedSize;
   SXCB Callback;
 };
@@ -22,21 +22,27 @@ struct SXDataType {
 // another one writes (SXWriteMsg); two writers on one socket need a lock in
 // the caller, and so does SXClose against a thread that still uses the socket.
 //
-// Timeouts: a zero timeout means no limit. A signal neither fails a call nor
-// restarts its timeout, with one exception: SXAccpet waiting for a client.
+// Timeouts: a zero timeout means no limit, except in the handshake, where a
+// zero ReadTimeout or WriteTimeout counts as 10 s. A signal neither fails a
+// call nor restarts its timeout, with one exception: SXAccpet waiting for a
+// client.
 struct SXConnection {
   // set by SXConnect (the connection) and SXListen (the listener), -1 if the
   // call failed
   int socket;
   struct SXDataType *SXDataType[256];
   int KeepAlive; // seconds before the first probe and between probes; 0 = off
-  // for each read of SXProcessMsg (the type, the size, the data with its crc)
-  // and of the handshake; the first one is the wait for a new message
+  // for each read of SXProcessMsg (the type, the size, the data with its crc;
+  // with a key the length, then the record) and of the handshake; the first
+  // one is the wait for a new message
   struct timeval ReadTimeout;
   struct timeval WriteTimeout; // for one whole frame
-  uint32_t MaxSize; // 0 = no limit (the Go version rejects non-empty messages)
-  // AES-128/192/256 key in hex; NULL or "" = no encryption. A key needs the
-  // library compiled with -DSX_ENCRYPTION (make ENCRYPTION=1), which links
+  uint32_t MaxSize; // of the data of one message; 0 = only messages without data
+  // 16, 24 or 32 random bytes in hex (openssl rand -hex 32), not a password;
+  // NULL or "" = no encryption. With a key every message is encrypted and
+  // authenticated (AES-256-GCM). The handshake decides it for the socket:
+  // clearing AESKey afterwards does not turn the encryption off. A key needs
+  // the library compiled with -DSX_ENCRYPTION (make ENCRYPTION=1), which links
   // OpenSSL libcrypto. The struct is the same in both builds.
   const char *AESKey;
   // for the TCP connects of SXConnect, shared between the addresses of the
@@ -45,13 +51,14 @@ struct SXConnection {
   struct timeval ConnectTimeout;
 };
 
-// Returns 0. The layout of the handshake packet is checked at compile time;
-// the function stays for the programs that call it.
+// Returns 0; stays for the programs that call it.
 int SXInit(void);
 
 // SXConnect, SXListen and SXAccpet return -7 when AESKey is set and the
 // library was compiled without SX_ENCRYPTION, and -8 before any I/O when
-// AESKey is not 32, 48 or 64 hex digits.
+// AESKey is not 32, 48 or 64 hex digits. SXConnect and SXAccpet return -9
+// when the key confirmation of the handshake fails: the peer has another
+// AESKey, or somebody changed the handshake on the way.
 
 // Connects and does the handshake, the socket is in conn->socket.
 // -2 host not resolved, -4 no address connected, -5 socket options,
@@ -79,17 +86,19 @@ int SXClose(int sock);
 // leaves the stream in the middle of a message: SXClose the socket, don't
 // retry.
 
-// -1 type not defined, -2 msgLen differs from FixedSize, -3 message longer
-// than the size header or MaxSize allows, -4 invalid SizeBytes, -5 write
-// failed or timed out (also: AESKey is set and sock has no cipher, see
-// SXClose), -10 out of memory.
+// -1 type not defined, -2 msgLen differs from FixedSize or is not 0 for a
+// type without data, -3 message longer than the size header or MaxSize
+// allows, -4 invalid SizeBytes, -5 write failed or timed out (also: AESKey is
+// set and sock has no cipher, see SXClose), -10 out of memory.
 int SXWriteMsg(struct SXConnection *conn, int sock, uint8_t msgType,
                const void *msg, uint32_t msgLen);
 
 // Reads one message and calls its callback.
 // -1 type not defined or invalid SizeBytes, -2 read failed (timeout, closed
-// connection), -3 crc mismatch, -4 message longer than MaxSize, -10 out of
-// memory.
+// connection), -3 crc mismatch; with a key: the message is not authentic
+// (changed, repeated, dropped or reordered on the way) or sock has no cipher,
+// -4 message longer than MaxSize or of a size its type does not allow (with a
+// key an invalid SizeBytes is reported here, not as -1), -10 out of memory.
 int SXProcessMsg(struct SXConnection *conn, int sock);
 
 #endif

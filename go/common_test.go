@@ -87,16 +87,17 @@ type hsResult struct {
 	err error
 }
 
-// handshake runs initConnection of both sides over a fresh socket pair.
+// handshake runs initConnection of both sides over a fresh socket pair: a is
+// the client, b the server.
 func handshake(t *testing.T, a, b *Connection) (hsResult, hsResult) {
 	t.Helper()
 	ca, cb := tcpPair(t)
 	resA := make(chan hsResult, 1)
 	go func() {
-		s, err := a.initConnection(ca)
+		s, err := a.initConnection(ca, false)
 		resA <- hsResult{s, err}
 	}()
-	s, err := b.initConnection(cb)
+	s, err := b.initConnection(cb, true)
 	return <-resA, hsResult{s, err}
 }
 
@@ -143,11 +144,12 @@ func freeAddr(t *testing.T) string {
 func TestHandshakeMismatch(t *testing.T) {
 	base := func() *Connection { return newConn(key128, allTypes(nil)) }
 	cases := map[string]func(c *Connection){
-		"SizeBytes":  func(c *Connection) { c.Types[tOne] = DataTypeCB{SizeBytes: 2} },
-		"FixedSize":  func(c *Connection) { c.Types[tFixed] = DataTypeCB{SizeBytes: -1, FixedSize: fixedSize + 1} },
-		"MaxSize":    func(c *Connection) { c.MaxSize++ },
-		"extra type": func(c *Connection) { c.Types[200] = DataTypeCB{SizeBytes: 1} },
-		"encryption": func(c *Connection) { c.AESKey = "" },
+		"SizeBytes":               func(c *Connection) { c.Types[tOne] = DataTypeCB{SizeBytes: 2} },
+		"FixedSize":               func(c *Connection) { c.Types[tFixed] = DataTypeCB{SizeBytes: -1, FixedSize: fixedSize + 1} },
+		"MaxSize":                 func(c *Connection) { c.MaxSize++ },
+		"extra type":              func(c *Connection) { c.Types[200] = DataTypeCB{SizeBytes: 1} },
+		"extra type without data": func(c *Connection) { c.Types[200] = DataTypeCB{} },
+		"encryption":              func(c *Connection) { c.AESKey = "" },
 	}
 	for name, change := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -223,7 +225,7 @@ func TestWriteDuringHandshake(t *testing.T) {
 	ca, _ := tcpPair(t) // the other end never answers
 	hsDone := make(chan struct{})
 	go func() {
-		a.initConnection(ca)
+		a.initConnection(ca, false)
 		close(hsDone)
 	}()
 	time.Sleep(50 * time.Millisecond) // let the handshake block in read
@@ -298,7 +300,9 @@ func TestWriteMsgErrors(t *testing.T) {
 		{"unknown type", 200, 0, "unknown msg type"},
 		{"1-byte size", tOne, 256, "1-byte size header"},
 		{"2-byte size", tTwo, 0x10000, "2-byte size header"},
-		{"short fixed buffer", tFixed, fixedSize - 1, "have only"},
+		{"short fixed buffer", tFixed, fixedSize - 1, "fixed size"},
+		{"long fixed buffer", tFixed, fixedSize + 1, "fixed size"},
+		{"data for a type without data", tEmpty, 1, "no data"},
 		{"over MaxSize", tThree, int(c.MaxSize) + 1, "greater than maximum"},
 		{"invalid SizeBytes", tBad, 1, "invalid SizeBytes"},
 	}
@@ -361,18 +365,225 @@ func TestReadTimeout(t *testing.T) {
 	}
 }
 
+// A wrong key fails the handshake on both sides.
 func TestWrongKey(t *testing.T) {
-	// only a sized type: a zero-size one would pass for 1 of 256 garbage bytes
-	types := func() map[uint8]DataTypeCB { return map[uint8]DataTypeCB{tTwo: {SizeBytes: 2}} }
-	a, b := newConn(key128, types()), newConn(strings.Replace(key128, "00", "01", 1), types())
-	b.ReadTimeout = 300 * time.Millisecond
-	_, sb := connect(t, a, b) // the handshake does not check the key
+	a, b := newConn(key128, allTypes(nil)), newConn(strings.Replace(key128, "00", "01", 1), allTypes(nil))
+	ra, rb := handshake(t, a, b)
+	if !errors.Is(ra.err, errWrongKey) || !errors.Is(rb.err, errWrongKey) {
+		t.Fatalf("got %v / %v, want errWrongKey on both sides", ra.err, rb.err)
+	}
+}
 
-	if err := a.WriteMsg(tTwo, pattern(100)); err != nil {
+// A peer without the key that sends back what it gets does not pass the
+// handshake (it did in protocol 1.1).
+func TestHelloEcho(t *testing.T) {
+	server := newConn(key128, allTypes(nil))
+	ca, cb := tcpPair(t)
+	go func() {
+		buf := make([]byte, helloSize+tagSize)
+		for _, part := range [][]byte{buf[:helloSize], buf[helloSize:]} {
+			if _, err := io.ReadFull(ca, part); err != nil {
+				return
+			}
+			ca.Write(part)
+		}
+	}()
+	if _, err := server.initConnection(cb, true); !errors.Is(err, errWrongKey) {
+		t.Fatalf("got %v, want errWrongKey", err)
+	}
+}
+
+// mitm connects a client and a server through a relay. Everything the client
+// sends goes through change piece by piece: 0 is the hello, 1 the key
+// confirmation, 2 and up the records. What change returns goes to the server.
+func mitm(t *testing.T, client, server *Connection, change func(i int, piece []byte) [][]byte) (hsResult, hsResult) {
+	t.Helper()
+	ca, m1 := tcpPair(t)
+	m2, cb := tcpPair(t)
+	go io.Copy(m1, m2) // server to client, untouched
+	go func() {
+		defer m2.CloseWrite()
+		for i := 0; ; i++ {
+			piece := make([]byte, 4)
+			switch i {
+			case 0:
+				piece = make([]byte, helloSize)
+			case 1:
+				piece = make([]byte, tagSize)
+			}
+			if _, err := io.ReadFull(m1, piece); err != nil {
+				return
+			}
+			if i > 1 { // a record: its length, the rest, the tag
+				rest := make([]byte, (int(piece[0])|int(piece[1])<<8|int(piece[2])<<16)+tagSize)
+				if _, err := io.ReadFull(m1, rest); err != nil {
+					return
+				}
+				piece = append(piece, rest...)
+			}
+			for _, out := range change(i, piece) {
+				m2.Write(out)
+			}
+		}
+	}()
+
+	resC := make(chan hsResult, 1)
+	go func() {
+		s, err := client.initConnection(ca, false)
+		resC <- hsResult{s, err}
+	}()
+	s, err := server.initConnection(cb, true)
+	return <-resC, hsResult{s, err}
+}
+
+// Somebody in the path who changes, repeats, reorders or drops records: the
+// read loop ends and the callback does not get the message.
+func TestTamperedRecords(t *testing.T) {
+	var held []byte
+	cases := []struct {
+		name      string
+		change    func(i int, piece []byte) [][]byte
+		delivered int // messages that reach the callback before the error
+	}{
+		{"changed data", func(i int, p []byte) [][]byte {
+			if i == 2 {
+				p[4] ^= 1
+			}
+			return [][]byte{p}
+		}, 0},
+		{"changed tag", func(i int, p []byte) [][]byte {
+			if i == 2 {
+				p[len(p)-1] ^= 1
+			}
+			return [][]byte{p}
+		}, 0},
+		{"shorter length", func(i int, p []byte) [][]byte {
+			if i == 2 {
+				p[0]--
+			}
+			return [][]byte{p}
+		}, 0},
+		{"repeated", func(i int, p []byte) [][]byte {
+			if i == 2 {
+				return [][]byte{p, p}
+			}
+			return [][]byte{p}
+		}, 1},
+		{"reordered", func(i int, p []byte) [][]byte {
+			if i == 2 {
+				held = p
+				return nil
+			}
+			if i == 3 {
+				return [][]byte{p, held}
+			}
+			return [][]byte{p}
+		}, 0},
+		{"dropped", func(i int, p []byte) [][]byte {
+			if i == 2 {
+				return nil
+			}
+			return [][]byte{p}
+		}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make(chan received, 10)
+			client, server := newConn(key128, allTypes(nil)), newConn(key128, allTypes(got))
+			rc, rs := mitm(t, client, server, tc.change)
+			if rc.err != nil || rs.err != nil {
+				t.Fatalf("handshake: %v / %v", rc.err, rs.err)
+			}
+			for _, size := range []int{100, 200} {
+				if err := client.WriteMsg(tTwo, pattern(size)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := server.run(rs.s); !errors.Is(err, errAuth) {
+				t.Fatalf("got %v, want errAuth", err)
+			}
+			if len(got) != tc.delivered {
+				t.Fatalf("%d messages reached the callback, want %d", len(got), tc.delivered)
+			}
+		})
+	}
+}
+
+// A hello changed on the way gives the two sides different keys.
+func TestTamperedHello(t *testing.T) {
+	client, server := newConn(key128, allTypes(nil)), newConn(key128, allTypes(nil))
+	rc, rs := mitm(t, client, server, func(i int, p []byte) [][]byte {
+		if i == 0 {
+			p[helloNonce] ^= 1
+		}
+		return [][]byte{p}
+	})
+	if !errors.Is(rc.err, errWrongKey) || !errors.Is(rs.err, errWrongKey) {
+		t.Fatalf("got %v / %v, want errWrongKey on both sides", rc.err, rs.err)
+	}
+}
+
+// Everything a client sent in one session, sent again to the same server: the
+// new nonce of the server gives other keys.
+func TestSessionReplay(t *testing.T) {
+	var recorded []byte
+	client, server := newConn(key128, allTypes(nil)), newConn(key128, allTypes(nil))
+	rc, rs := mitm(t, client, server, func(_ int, p []byte) [][]byte {
+		recorded = append(recorded, p...)
+		return [][]byte{p}
+	})
+	if rc.err != nil || rs.err != nil {
+		t.Fatalf("handshake: %v / %v", rc.err, rs.err)
+	}
+	if len(recorded) != helloSize+tagSize {
+		t.Fatalf("recorded %d bytes of handshake", len(recorded))
+	}
+
+	ca, cb := tcpPair(t)
+	if _, err := ca.Write(recorded); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.run(sb); err == nil {
-		t.Fatal("message encrypted with another key was accepted")
+	if _, err := server.initConnection(cb, true); !errors.Is(err, errWrongKey) {
+		t.Fatalf("got %v, want errWrongKey", err)
+	}
+}
+
+// Zero ReadTimeout and WriteTimeout mean no limit, as in the C version.
+func TestZeroTimeouts(t *testing.T) {
+	got := make(chan received, 1)
+	a, b := newConn(key128, allTypes(nil)), newConn(key128, allTypes(got))
+	a.ReadTimeout, a.WriteTimeout, b.ReadTimeout, b.WriteTimeout = 0, 0, 0, 0
+	_, sb := connect(t, a, b)
+	go b.run(sb)
+
+	time.Sleep(100 * time.Millisecond)
+	if err := a.WriteMsg(tOne, []byte("late")); err != nil {
+		t.Fatal(err)
+	}
+	if m := wait(t, got); string(m.data) != "late" {
+		t.Fatalf("got %q", m.data)
+	}
+	b.Disconnect()
+}
+
+// The handshake has a limit of its own when the timeouts are zero.
+func TestHandshakeTimeoutWithZeroTimeouts(t *testing.T) {
+	old := handshakeTimeout
+	handshakeTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { handshakeTimeout = old })
+
+	a := newConn("", allTypes(nil))
+	a.ReadTimeout, a.WriteTimeout = 0, 0
+	ca, _ := tcpPair(t) // the other end never answers
+
+	start := time.Now()
+	_, err := a.initConnection(ca, true)
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("got %v, want a timeout", err)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("handshake waited %v", waited)
 	}
 }
 
